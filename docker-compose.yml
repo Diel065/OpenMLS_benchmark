@@ -1,0 +1,173 @@
+name: mls-benchmark
+
+x-worker-common: &worker-common
+  image: mls-app
+  entrypoint: ["/usr/local/bin/worker-entrypoint.sh"]
+  environment:
+    MODE: worker
+    DS_URL: http://ds:3000
+    RELAY_URL: http://relay:4000
+    OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+    OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+  depends_on:
+    - ds
+    - relay
+  volumes:
+    - ./benchmark_output:/results
+
+services:
+  ds:
+    image: mls-ds
+    command: ["ds", "--listen-addr", "0.0.0.0:3000"]
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./benchmark_output:/results
+
+  relay:
+    image: mls-relay
+    command: ["message_relay", "--listen-addr", "0.0.0.0:4000"]
+    ports:
+      - "4000:4000"
+    volumes:
+      - ./benchmark_output:/results
+
+  worker-00001:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00001"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00001.jsonl
+    ports:
+      - "8081:8080"
+
+  worker-00002:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00002"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00002.jsonl
+    ports:
+      - "8082:8080"
+
+  worker-00003:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00003"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00003.jsonl
+    ports:
+      - "8083:8080"
+
+  worker-00004:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00004"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00004.jsonl
+    ports:
+      - "8084:8080"
+
+  worker-00005:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00005"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00005.jsonl
+    ports:
+      - "8085:8080"
+
+  worker-00006:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00006"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00006.jsonl
+    ports:
+      - "8086:8080"
+
+  worker-00007:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00007"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00007.jsonl
+    ports:
+      - "8087:8080"
+
+  worker-00008:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00008"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00008.jsonl
+    ports:
+      - "8088:8080"
+
+  worker-00009:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00009"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00009.jsonl
+    ports:
+      - "8089:8080"
+
+  worker-00010:
+    <<: *worker-common
+    environment:
+      MODE: worker
+      WORKER_NAME: "00010"
+      DS_URL: http://ds:3000
+      RELAY_URL: http://relay:4000
+      LISTEN_ADDR: 0.0.0.0:8080
+      OPENMLS_PROFILE_RUN_ID: ${RUN_ID:-compose-smoke-001}
+      OPENMLS_PROFILE_SCENARIO: ${SCENARIO:-http-staircase-compose}
+      OPENMLS_PROFILE_PATH: /results/${RUN_ID:-compose-smoke-001}/client-00010.jsonl
+    ports:
+      - "8090:8080"
