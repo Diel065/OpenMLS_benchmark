@@ -11,6 +11,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Generate a docker-compose file plus worker lists for many MLS workers."
         )
     )
+
     p.add_argument("--workers", type=int, required=True, help="Number of worker services to generate")
     p.add_argument("--run-id", default="compose-generated-001", help="Default run id baked into the compose env")
     p.add_argument("--scenario", default="http-staircase-compose", help="Default scenario baked into the compose env")
@@ -22,6 +23,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--base-worker-port", type=int, default=8081, help="First published host port for workers")
     p.add_argument("--ds-port", type=int, default=3000, help="Published DS port")
     p.add_argument("--relay-port", type=int, default=4000, help="Published relay port")
+
+    p.add_argument(
+        "--publish-workers",
+        action="store_true",
+        help="Publish every worker on a host port. Disable this for large runs.",
+    )
+
+    p.add_argument(
+        "--include-runner",
+        action="store_true",
+        help="Include a runner service that can run inside the Docker network.",
+    )
+
     return p
 
 
@@ -43,17 +57,18 @@ def validate_args(args: argparse.Namespace) -> None:
     if not (1 <= args.relay_port <= 65535):
         raise SystemExit("--relay-port must be between 1 and 65535")
 
-    last_port = args.base_worker_port + args.workers - 1
-    if last_port > 65535:
-        raise SystemExit(
-            f"Worker host ports would exceed 65535: last port would be {last_port}"
-        )
+    if args.publish_workers:
+        last_port = args.base_worker_port + args.workers - 1
+        if last_port > 65535:
+            raise SystemExit(
+                f"Worker host ports would exceed 65535: last port would be {last_port}"
+            )
 
 
 def generate_compose_text(args: argparse.Namespace) -> str:
     lines: list[str] = []
 
-    lines.append(f'name: {args.project_name}')
+    lines.append(f"name: {args.project_name}")
     lines.append("")
     lines.append("x-worker-common: &worker-common")
     lines.append("  image: mls-worker")
@@ -67,12 +82,14 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append(f"    - ./{args.output_dir}:/results")
     lines.append("")
     lines.append("services:")
+
     lines.append("  ds:")
     lines.append("    image: mls-ds")
     lines.append(f'    command: ["--listen-addr", "0.0.0.0:{args.ds_port}"]')
     lines.append("    ports:")
     lines.append(f'      - "{args.ds_port}:{args.ds_port}"')
     lines.append("")
+
     lines.append("  relay:")
     lines.append("    image: mls-relay")
     lines.append(f'    command: ["--listen-addr", "0.0.0.0:{args.relay_port}"]')
@@ -100,8 +117,22 @@ def generate_compose_text(args: argparse.Namespace) -> str:
         lines.append(f"      OPENMLS_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO: {args.scenario}")
         lines.append(f"      OPENMLS_PROFILE_PATH: /results/{args.run_id}/client-{wid}.jsonl")
-        lines.append("    ports:")
-        lines.append(f'      - "{host_port}:8080"')
+
+        if args.publish_workers:
+            lines.append("    ports:")
+            lines.append(f'      - "{host_port}:8080"')
+
+    # Important: this block must be OUTSIDE the worker loop.
+    # Otherwise the generated compose file gets one duplicate runner service per worker.
+    if args.include_runner:
+        lines.append("")
+        lines.append("  runner:")
+        lines.append("    image: mls-runner")
+        lines.append("    depends_on:")
+        lines.append("      - ds")
+        lines.append("      - relay")
+        lines.append("    volumes:")
+        lines.append(f"      - ./{args.output_dir}:/results")
 
     return "\n".join(lines) + "\n"
 
@@ -149,7 +180,15 @@ def main() -> None:
     print("What you generated:")
     print(f"- Compose file with {args.workers} workers")
     print("- workers.txt for an in-network runner")
-    print("- workers.host.txt for the current host-runner workflow")
+    print("- workers.host.txt for the host-runner workflow")
+
+    if args.publish_workers:
+        print("- worker ports are published on the host")
+    else:
+        print("- worker ports are internal-only")
+
+    if args.include_runner:
+        print("- runner service included")
 
 
 if __name__ == "__main__":

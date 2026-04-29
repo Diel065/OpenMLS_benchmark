@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import argparse
 import datetime as dt
 import re
@@ -43,6 +44,69 @@ def build_parser() -> argparse.ArgumentParser:
 
     p.add_argument("--health-timeout-seconds", type=int, default=90)
     p.add_argument("--health-poll-seconds", type=float, default=0.5)
+
+    p.add_argument(
+        "--startup-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Start worker containers in batches of this size. "
+            "0 means use one normal docker compose up for all services."
+        ),
+    )
+
+    p.add_argument(
+        "--startup-batch-sleep-seconds",
+        type=float,
+        default=0.25,
+        help="Sleep this many seconds between worker startup batches.",
+    )
+
+    p.add_argument(
+        "--compose-parallel-limit",
+        type=int,
+        default=None,
+        help=(
+            "Set COMPOSE_PARALLEL_LIMIT for docker compose operations. "
+            "Useful for avoiding Docker daemon overload with many containers."
+        ),
+    )
+
+    p.add_argument(
+        "--compose-down-timeout-seconds",
+        type=int,
+        default=1,
+        help=(
+            "Shutdown timeout for docker compose down. "
+            "Use a small value for benchmark containers to avoid long teardown waits."
+        ),
+    )
+
+    p.add_argument(
+        "--teardown-batch-size",
+        type=int,
+        default=0,
+        help=(
+            "Stop/remove worker containers in batches of this size before final compose down. "
+            "0 means use normal docker compose down for the whole stack."
+        ),
+    )
+
+    p.add_argument(
+        "--teardown-batch-sleep-seconds",
+        type=float,
+        default=0.25,
+        help="Sleep this many seconds between teardown batches.",
+    )
+
+    p.add_argument(
+        "--runner-in-docker",
+        action="store_true",
+        help=(
+            "Run benchmark_runner_http_staircase inside the Docker network. "
+            "This allows workers to avoid publishing host ports."
+        ),
+    )
 
     p.add_argument(
         "--build-images",
@@ -181,7 +245,10 @@ def port_is_free(port: int) -> bool:
 
 def required_host_ports(args: argparse.Namespace) -> list[int]:
     ports = [args.ds_port, args.relay_port]
-    ports.extend(args.base_worker_port + i for i in range(args.workers))
+
+    if not args.runner_in_docker:
+        ports.extend(args.base_worker_port + i for i in range(args.workers))
+
     return ports
 
 
@@ -250,6 +317,132 @@ def write_compose_logs(root: Path, compose_file: Path, dest: Path, append: bool 
             text=True,
         )
 
+def worker_service_names(worker_count: int) -> list[str]:
+    return [f"worker-{i:05d}" for i in range(1, worker_count + 1)]
+
+
+def chunks(items: list[str], size: int):
+    for start in range(0, len(items), size):
+        yield items[start:start + size]
+
+
+def compose_down(
+        *,
+        root: Path,
+        compose_file: Path,
+        args: argparse.Namespace,
+        env: dict[str, str] | None,
+) -> None:
+    timeout = str(args.compose_down_timeout_seconds)
+
+    if args.teardown_batch_size <= 0:
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "down",
+                "--timeout",
+                timeout,
+            ],
+            cwd=str(root),
+            env=env,
+            check=False,
+        )
+        return
+
+    # If the benchmark runner container is still alive because of an interrupt/error,
+    # stop it first so it does not keep sending requests while workers are removed.
+    print("[compose] stopping/removing runner service if present")
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "stop",
+            "-t",
+            timeout,
+            "runner",
+        ],
+        cwd=str(root),
+        env=env,
+        check=False,
+    )
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "rm",
+            "-f",
+            "runner",
+        ],
+        cwd=str(root),
+        env=env,
+        check=False,
+    )
+
+    workers = worker_service_names(args.workers)
+    workers.reverse()
+
+    for batch in chunks(workers, args.teardown_batch_size):
+        print(
+            f"[compose] stopping/removing workers {batch[-1]} .. {batch[0]} "
+            f"({len(batch)} workers)"
+        )
+
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "stop",
+                "-t",
+                timeout,
+                *batch,
+            ],
+            cwd=str(root),
+            env=env,
+            check=False,
+        )
+
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "rm",
+                "-f",
+                *batch,
+            ],
+            cwd=str(root),
+            env=env,
+            check=False,
+        )
+
+        if args.teardown_batch_sleep_seconds > 0:
+            time.sleep(args.teardown_batch_sleep_seconds)
+
+    print("[compose] final down for ds/relay/network")
+    subprocess.run(
+        [
+            "docker",
+            "compose",
+            "-f",
+            str(compose_file),
+            "down",
+            "--timeout",
+            timeout,
+        ],
+        cwd=str(root),
+        env=env,
+        check=False,
+    )
 
 def main() -> int:
     args = build_parser().parse_args()
@@ -257,6 +450,24 @@ def main() -> int:
 
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+
+    if args.startup_batch_size < 0:
+        raise SystemExit("--startup-batch-size must be >= 0")
+
+    if args.startup_batch_sleep_seconds < 0:
+        raise SystemExit("--startup-batch-sleep-seconds must be >= 0")
+
+    if args.compose_parallel_limit is not None and args.compose_parallel_limit < 1:
+        raise SystemExit("--compose-parallel-limit must be >= 1")
+
+    if args.compose_down_timeout_seconds < 0:
+        raise SystemExit("--compose-down-timeout-seconds must be >= 0")
+
+    if args.teardown_batch_size < 0:
+        raise SystemExit("--teardown-batch-size must be >= 0")
+
+    if args.teardown_batch_sleep_seconds < 0:
+        raise SystemExit("--teardown-batch-sleep-seconds must be >= 0")
 
     run_id = args.run_id or timestamped_run_id(args.workers)
     scenario = args.scenario
@@ -278,6 +489,11 @@ def main() -> int:
         raise SystemExit(f"Missing generator script: {generator}")
 
     compose_up = False
+
+    compose_env = None
+    if args.compose_parallel_limit is not None:
+        compose_env = dict(os.environ)
+        compose_env["COMPOSE_PARALLEL_LIMIT"] = str(args.compose_parallel_limit)
 
     try:
         if args.force_cleanup_mls_ports:
@@ -329,25 +545,73 @@ def main() -> int:
             "--relay-port",
             str(args.relay_port),
         ]
+
+        if args.runner_in_docker:
+            generator_cmd.append("--include-runner")
+        else:
+            generator_cmd.append("--publish-workers")
+
         run_cmd(generator_cmd, cwd=root)
 
         copy_if_exists(compose_tmp, run_dir / "docker-compose.generated.yml")
         copy_if_exists(workers_internal_tmp, run_dir / "workers.txt")
         copy_if_exists(workers_host_tmp, run_dir / "workers.host.txt")
 
+        compose_env = None
+        if args.compose_parallel_limit is not None:
+            compose_env = os.environ.copy()
+            compose_env["COMPOSE_PARALLEL_LIMIT"] = str(args.compose_parallel_limit)
+
         try:
-            run_cmd(
-                ["docker", "compose", "-f", str(compose_tmp), "up", "-d"],
-                cwd=root,
-            )
-            compose_up = True
+            if args.startup_batch_size > 0:
+                print("[compose] starting ds and relay")
+                run_cmd(
+                    ["docker", "compose", "-f", str(compose_tmp), "up", "-d", "ds", "relay"],
+                    cwd=root,
+                    env=compose_env,
+                )
+                compose_up = True
+
+                if args.startup_batch_sleep_seconds > 0:
+                    time.sleep(args.startup_batch_sleep_seconds)
+
+                worker_services = [
+                    f"worker-{i:05d}"
+                    for i in range(1, args.workers + 1)
+                ]
+
+                for start in range(0, len(worker_services), args.startup_batch_size):
+                    batch = worker_services[start:start + args.startup_batch_size]
+                    print(
+                        f"[compose] starting workers {batch[0]} .. {batch[-1]} "
+                        f"({start + len(batch)}/{len(worker_services)})"
+                    )
+
+                    run_cmd(
+                        ["docker", "compose", "-f", str(compose_tmp), "up", "-d", *batch],
+                        cwd=root,
+                        env=compose_env,
+                    )
+
+                    if args.startup_batch_sleep_seconds > 0:
+                        time.sleep(args.startup_batch_sleep_seconds)
+            else:
+                run_cmd(
+                    ["docker", "compose", "-f", str(compose_tmp), "up", "-d"],
+                    cwd=root,
+                    env=compose_env,
+                )
+                compose_up = True
+
         except subprocess.CalledProcessError as e:
             write_compose_logs(root, compose_tmp, compose_logs_path, append=False)
-            subprocess.run(
-                ["docker", "compose", "-f", str(compose_tmp), "down"],
-                cwd=str(root),
-                check=False,
+            compose_down(
+                root=root,
+                compose_file=compose_tmp,
+                args=args,
+                env=compose_env,
             )
+
             raise RuntimeError(
                 "docker compose up failed.\n"
                 f"See compose logs in: {compose_logs_path}\n"
@@ -365,56 +629,100 @@ def main() -> int:
             args.health_poll_seconds,
         )
 
-        for line in read_worker_lines(workers_host_tmp):
-            worker_id, worker_url = line.split("=", 1)
-            wait_for_health(
-                f"{worker_url}/health",
-                args.health_timeout_seconds,
-                args.health_poll_seconds,
-            )
-            print(f"[health] worker {worker_id} ok")
+        if args.runner_in_docker:
+            print("[health] skipping host worker health checks; runner will check workers inside Docker network")
+        else:
+            for line in read_worker_lines(workers_host_tmp):
+                worker_id, worker_url = line.split("=", 1)
+                wait_for_health(
+                    f"{worker_url}/health",
+                    args.health_timeout_seconds,
+                    args.health_poll_seconds,
+                )
+                print(f"[health] worker {worker_id} ok")
 
-        benchmark_cmd = [
-            "cargo",
-            "run",
-            "--bin",
-            "benchmark_runner_http_staircase",
-            "--",
-            "--ds-url",
-            f"http://127.0.0.1:{args.ds_port}",
-            "--workers-file",
-            str(workers_host_tmp),
-            "--min-size",
-            str(args.min_size),
-            "--max-size",
-            str(args.max_size if args.max_size is not None else args.workers),
-            "--step-size",
-            str(args.step_size),
-            "--roundtrips",
-            str(args.roundtrips),
-            "--update-rounds",
-            str(args.update_rounds),
-            "--max-update-samples-per-plateau",
-            str(args.max_update_samples_per_plateau),
-            "--app-rounds",
-            str(args.app_rounds),
-            "--max-app-samples-per-payload",
-            str(args.max_app_samples_per_payload),
-            "--payload-sizes",
-            args.payload_sizes,
-            "--run-id",
-            run_id,
-            "--scenario",
-            scenario,
-            "--output-dir",
-            output_dir_name,
-        ]
+        if args.runner_in_docker:
+            benchmark_cmd = [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_tmp),
+                "run",
+                "--rm",
+                "runner",
+                "--ds-url",
+                f"http://ds:{args.ds_port}",
+                "--workers-file",
+                f"/results/{run_id}/workers.txt",
+                "--min-size",
+                str(args.min_size),
+                "--max-size",
+                str(args.max_size if args.max_size is not None else args.workers),
+                "--step-size",
+                str(args.step_size),
+                "--roundtrips",
+                str(args.roundtrips),
+                "--update-rounds",
+                str(args.update_rounds),
+                "--max-update-samples-per-plateau",
+                str(args.max_update_samples_per_plateau),
+                "--app-rounds",
+                str(args.app_rounds),
+                "--max-app-samples-per-payload",
+                str(args.max_app_samples_per_payload),
+                "--payload-sizes",
+                args.payload_sizes,
+                "--run-id",
+                run_id,
+                "--scenario",
+                scenario,
+                "--output-dir",
+                "/results",
+            ]
+        else:
+            benchmark_cmd = [
+                "cargo",
+                "run",
+                "--bin",
+                "benchmark_runner_http_staircase",
+                "--",
+                "--ds-url",
+                f"http://127.0.0.1:{args.ds_port}",
+                "--workers-file",
+                str(workers_host_tmp),
+                "--min-size",
+                str(args.min_size),
+                "--max-size",
+                str(args.max_size if args.max_size is not None else args.workers),
+                "--step-size",
+                str(args.step_size),
+                "--roundtrips",
+                str(args.roundtrips),
+                "--update-rounds",
+                str(args.update_rounds),
+                "--max-update-samples-per-plateau",
+                str(args.max_update_samples_per_plateau),
+                "--app-rounds",
+                str(args.app_rounds),
+                "--max-app-samples-per-payload",
+                str(args.max_app_samples_per_payload),
+                "--payload-sizes",
+                args.payload_sizes,
+                "--run-id",
+                run_id,
+                "--scenario",
+                scenario,
+                "--output-dir",
+                output_dir_name,
+            ]
 
         exit_code = tee_subprocess_output(
             benchmark_cmd,
             cwd=root,
             output_path=terminal_output_path,
+            env=compose_env if args.runner_in_docker else None,
         )
+
         if exit_code != 0:
             raise RuntimeError(f"Benchmark runner exited with code {exit_code}")
 
@@ -433,12 +741,13 @@ def main() -> int:
             except Exception:
                 pass
 
-            if not args.keep_stack_up:
-                subprocess.run(
-                    ["docker", "compose", "-f", str(compose_tmp), "down"],
-                    cwd=str(root),
-                    check=False,
-                )
+        if not args.keep_stack_up:
+            compose_down(
+                root=root,
+                compose_file=compose_tmp,
+                args=args,
+                env=compose_env,
+            )
 
         if not args.keep_generated_files:
             for path in (compose_tmp, workers_internal_tmp, workers_host_tmp):
