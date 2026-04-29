@@ -50,7 +50,7 @@ fn parse_args() -> Result<SocketAddr> {
     Ok(listen_addr.unwrap_or_else(|| "127.0.0.1:3000".parse().unwrap()))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let addr = parse_args()?;
 
@@ -58,9 +58,15 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/keypackage/{owner}", post(publish_key_package).get(fetch_key_package))
+        .route(
+            "/keypackage/{owner}",
+            post(publish_key_package).get(fetch_key_package),
+        )
         .route("/commit/{recipient}", get(fetch_commit))
-        .route("/welcome/{recipient}", post(publish_welcome).get(fetch_welcome))
+        .route(
+            "/welcome/{recipient}",
+            post(publish_welcome).get(fetch_welcome),
+        )
         .route(
             "/ratchet-tree/{recipient}",
             post(publish_ratchet_tree).get(fetch_ratchet_tree),
@@ -101,10 +107,7 @@ async fn publish_key_package(
     StatusCode::OK
 }
 
-async fn fetch_key_package(
-    State(state): State<SharedDs>,
-    Path(owner): Path<String>,
-) -> Response {
+async fn fetch_key_package(State(state): State<SharedDs>, Path(owner): Path<String>) -> Response {
     let mut ds = state.lock().unwrap();
     match ds.fetch_key_package(&owner) {
         Some(bytes) => bytes_response(bytes),
@@ -121,28 +124,28 @@ async fn put_group_state(
 
     match ds.put_group_state(&group_id, epoch, body.members) {
         Ok(()) => {
-            println!("[DS] Updated group state for group={} epoch={}", group_id, epoch);
+            println!(
+                "[DS] Updated group state for group={} epoch={}",
+                group_id, epoch
+            );
             StatusCode::OK.into_response()
         }
         Err(message) => (StatusCode::CONFLICT, message).into_response(),
     }
 }
 
-async fn get_group_state(
-    State(state): State<SharedDs>,
-    Path(group_id): Path<String>,
-) -> Response {
+async fn get_group_state(State(state): State<SharedDs>, Path(group_id): Path<String>) -> Response {
     let ds = state.lock().unwrap();
     match ds.get_group_state(&group_id) {
         Some(GroupInfo {
-                 current_epoch,
-                 members,
-             }) => Json(GroupStateResponse {
+            current_epoch,
+            members,
+        }) => Json(GroupStateResponse {
             group_id,
             current_epoch,
             members,
         })
-            .into_response(),
+        .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
     }
 }
@@ -160,10 +163,7 @@ async fn publish_group_commit(
     }
 }
 
-async fn fetch_commit(
-    State(state): State<SharedDs>,
-    Path(recipient): Path<String>,
-) -> Response {
+async fn fetch_commit(State(state): State<SharedDs>, Path(recipient): Path<String>) -> Response {
     let mut ds = state.lock().unwrap();
     match ds.fetch_commit(&recipient) {
         Some(bytes) => bytes_response(bytes),
@@ -182,10 +182,7 @@ async fn publish_welcome(
     StatusCode::OK
 }
 
-async fn fetch_welcome(
-    State(state): State<SharedDs>,
-    Path(recipient): Path<String>,
-) -> Response {
+async fn fetch_welcome(State(state): State<SharedDs>, Path(recipient): Path<String>) -> Response {
     let mut ds = state.lock().unwrap();
     match ds.fetch_welcome(&recipient) {
         Some(bytes) => bytes_response(bytes),

@@ -1,35 +1,53 @@
+# syntax=docker/dockerfile:1.7
+
 # ---------- builder ----------
 FROM rust:bookworm AS builder
 
 WORKDIR /app
 
-COPY . .
-
-RUN cargo build --release --bin ds --bin message_relay --bin worker --bin benchmark_runner_http_staircase
-
-# ---------- common runtime base ----------
-FROM debian:bookworm-slim AS runtime-base
-
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates \
+RUN rustup target add x86_64-unknown-linux-musl \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        musl-tools \
+        clang \
+        lld \
+        cmake \
+        make \
+        pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
+COPY . .
+
+RUN cargo build \
+    --release \
+    --target x86_64-unknown-linux-musl \
+    --bin ds \
+    --bin message_relay \
+    --bin worker \
+    --bin benchmark_runner_http_staircase
+
+RUN mkdir -p /out \
+    && cp /app/target/x86_64-unknown-linux-musl/release/ds /out/ds \
+    && cp /app/target/x86_64-unknown-linux-musl/release/message_relay /out/message_relay \
+    && cp /app/target/x86_64-unknown-linux-musl/release/worker /out/worker \
+    && cp /app/target/x86_64-unknown-linux-musl/release/benchmark_runner_http_staircase /out/benchmark_runner_http_staircase
 
 # ---------- ds runtime ----------
-FROM runtime-base AS ds-runtime
-COPY --from=builder /app/target/release/ds /usr/local/bin/ds
-CMD ["ds"]
+FROM scratch AS ds-runtime
+COPY --from=builder /out/ds /ds
+ENTRYPOINT ["/ds"]
 
 # ---------- relay runtime ----------
-FROM runtime-base AS relay-runtime
-COPY --from=builder /app/target/release/message_relay /usr/local/bin/message_relay
-CMD ["message_relay"]
+FROM scratch AS relay-runtime
+COPY --from=builder /out/message_relay /message_relay
+ENTRYPOINT ["/message_relay"]
 
-# ---------- shared app runtime ----------
-FROM runtime-base AS app-runtime
-COPY --from=builder /app/target/release/worker /usr/local/bin/worker
-COPY --from=builder /app/target/release/benchmark_runner_http_staircase /usr/local/bin/benchmark_runner_http_staircase
-COPY docker/worker-entrypoint.sh /usr/local/bin/worker-entrypoint.sh
-RUN chmod +x /usr/local/bin/worker-entrypoint.sh
-CMD ["worker"]
+# ---------- worker runtime ----------
+FROM scratch AS worker-runtime
+COPY --from=builder /out/worker /worker
+ENTRYPOINT ["/worker"]
+
+# ---------- runner runtime ----------
+FROM scratch AS runner-runtime
+COPY --from=builder /out/benchmark_runner_http_staircase /benchmark_runner_http_staircase
+ENTRYPOINT ["/benchmark_runner_http_staircase"]

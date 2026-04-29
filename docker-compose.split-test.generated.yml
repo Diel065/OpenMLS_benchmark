@@ -1,0 +1,83 @@
+name: mls-split-test
+
+x-worker-common: &worker-common
+  image: mls-worker
+  environment:
+    OPENMLS_PROFILE_RUN_ID: split-test
+    OPENMLS_PROFILE_SCENARIO: split-runtime-test
+  depends_on:
+    - ds
+    - relay
+  volumes:
+    - ./benchmark_output:/results
+
+services:
+  ds:
+    image: mls-ds
+    command: ["ds", "--listen-addr", "0.0.0.0:3000"]
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./benchmark_output:/results
+
+  relay:
+    image: mls-relay
+    command: ["message_relay", "--listen-addr", "0.0.0.0:5000"]
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./benchmark_output:/results
+
+  worker-00001:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "00001"
+      - "--ds-url"
+      - "http://ds:3000"
+      - "--relay-url"
+      - "http://relay:5000"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: split-test
+      OPENMLS_PROFILE_SCENARIO: split-runtime-test
+      OPENMLS_PROFILE_PATH: /results/split-test/client-00001.jsonl
+    ports:
+      - "18081:8080"
+
+  worker-00002:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "00002"
+      - "--ds-url"
+      - "http://ds:3000"
+      - "--relay-url"
+      - "http://relay:5000"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: split-test
+      OPENMLS_PROFILE_SCENARIO: split-runtime-test
+      OPENMLS_PROFILE_PATH: /results/split-test/client-00002.jsonl
+    ports:
+      - "18082:8080"
+
+  worker-00003:
+    <<: *worker-common
+    command:
+      - "--name"
+      - "00003"
+      - "--ds-url"
+      - "http://ds:3000"
+      - "--relay-url"
+      - "http://relay:5000"
+      - "--listen-addr"
+      - "0.0.0.0:8080"
+    environment:
+      OPENMLS_PROFILE_RUN_ID: split-test
+      OPENMLS_PROFILE_SCENARIO: split-runtime-test
+      OPENMLS_PROFILE_PATH: /results/split-test/client-00003.jsonl
+    ports:
+      - "18083:8080"

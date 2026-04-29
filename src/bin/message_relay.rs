@@ -37,7 +37,7 @@ fn parse_args() -> Result<SocketAddr> {
     Ok(listen_addr.unwrap_or_else(|| "127.0.0.1:4000".parse().unwrap()))
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let addr = parse_args()?;
 

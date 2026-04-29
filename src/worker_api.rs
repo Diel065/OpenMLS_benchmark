@@ -147,7 +147,11 @@ pub fn relay_post_application_message(
     if !response.status().is_success() {
         let status = response.status();
         let body = response.text().unwrap_or_default();
-        return Err(anyhow!("Relay POST failed with status {}: {}", status, body));
+        return Err(anyhow!(
+            "Relay POST failed with status {}: {}",
+            status,
+            body
+        ));
     }
 
     Ok(())
@@ -163,7 +167,10 @@ pub fn relay_get_application_message(relay_url: &str, recipient: &str) -> Result
     let response = reqwest::blocking::get(url)?;
 
     if !response.status().is_success() {
-        return Err(anyhow!("Relay GET failed with status {}", response.status()));
+        return Err(anyhow!(
+            "Relay GET failed with status {}",
+            response.status()
+        ));
     }
 
     Ok(response.bytes()?.to_vec())
@@ -230,10 +237,16 @@ pub fn maybe_retry_pending_intent(
 
             let text = match intent {
                 PendingIntent::AddMembers { members, .. } => {
-                    format!("queued add_members for {:?} was retried and published", members)
+                    format!(
+                        "queued add_members for {:?} was retried and published",
+                        members
+                    )
                 }
                 PendingIntent::RemoveMembers { members } => {
-                    format!("queued remove_members for {:?} was retried and published", members)
+                    format!(
+                        "queued remove_members for {:?} was retried and published",
+                        members
+                    )
                 }
                 PendingIntent::SelfUpdate => {
                     "queued self_update was retried and published".to_string()

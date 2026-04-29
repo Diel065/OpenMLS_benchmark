@@ -1,5 +1,6 @@
 pub fn hex_prefix(bytes: &[u8], n: usize) -> String {
-    bytes.iter()
+    bytes
+        .iter()
         .take(n)
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()

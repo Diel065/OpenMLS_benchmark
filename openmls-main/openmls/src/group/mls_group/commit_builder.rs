@@ -481,7 +481,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 u64,
                 u32,
                 String,
-                usize,
+                isize,
                 usize,
                 Option<usize>,
             ),
@@ -558,6 +558,8 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
             } else {
                 "update_commit_create"
             };
+
+            let invitee_count = add_count as isize - remove_count as isize;
 
             #[cfg(feature = "profiling-json")]
             let member_count_after = member_count_before
@@ -839,7 +841,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         let welcome_scope = ProfileScope::start("welcome_create_total", "openmls");
 
                         #[cfg(feature = "profiling-json")]
-                        let invitee_count = apply_proposals_values.invitation_list.len();
+                        let invitee_count = apply_proposals_values.invitation_list.len() as isize;
 
                         #[cfg(feature = "profiling-json")]
                         let group_epoch = diff.group_context().epoch().as_u64();
@@ -1065,7 +1067,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 final_group_epoch,
                 final_tree_size,
                 final_ciphersuite,
-                add_count,
+                invitee_count,
                 member_count_before,
                 commit_artifact_size_bytes,
             ))
@@ -1081,7 +1083,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                         u64,
                         u32,
                         String,
-                        usize,
+                        isize,
                         usize,
                         Option<usize>,
                     ),
@@ -1099,7 +1101,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 final_group_epoch,
                 final_tree_size,
                 final_ciphersuite,
-                add_count,
+                invitee_count,
                 member_count_before,
                 commit_artifact_size_bytes,
             ) = measured_result.expect("allocation_counter measure closure did not run")?;
@@ -1111,7 +1113,7 @@ impl<'a, G: BorrowMut<MlsGroup>> CommitBuilder<'a, LoadedPsks, G> {
                 event.tree_size = Some(final_tree_size);
                 event.member_count = Some(member_count_before);
                 event.ciphersuite = Some(final_ciphersuite);
-                event.invitee_count = Some(add_count);
+                event.invitee_count = Some(invitee_count);
                 event.artifact_size_bytes = commit_artifact_size_bytes;
                 event.alloc_bytes = Some(allocation_info.bytes_total as u64);
                 event.alloc_count = Some(allocation_info.count_total as u64);

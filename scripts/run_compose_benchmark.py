@@ -295,7 +295,11 @@ def main() -> int:
                 cwd=root,
             )
             run_cmd(
-                ["docker", "build", "--target", "app-runtime", "-t", "mls-app", "."],
+                ["docker", "build", "--target", "worker-runtime", "-t", "mls-worker", "."],
+                cwd=root,
+            )
+            run_cmd(
+                ["docker", "build", "--target", "runner-runtime", "-t", "mls-runner", "."],
                 cwd=root,
             )
 

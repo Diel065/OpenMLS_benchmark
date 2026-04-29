@@ -8,6 +8,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
+use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::worker_api::{Command, CommandResponse};
@@ -58,7 +59,7 @@ struct ProfileEvent {
     group_epoch: Option<u64>,
     tree_size: Option<u32>,
     member_count: Option<usize>,
-    invitee_count: Option<usize>,
+    invitee_count: Option<isize>,
     ciphersuite: Option<String>,
     app_msg_plaintext_bytes: Option<usize>,
     app_msg_padding_bytes: Option<usize>,
@@ -116,7 +117,9 @@ impl Progress {
         };
 
         let percent = ratio * 100.0;
-        let eta_text = eta.map(format_hms).unwrap_or_else(|| "--:--:--".to_string());
+        let eta_text = eta
+            .map(format_hms)
+            .unwrap_or_else(|| "--:--:--".to_string());
 
         eprint!(
             "\r[{}] {:6.2}% | {}/{} units | elapsed {} | ETA {} | {}",
@@ -456,8 +459,7 @@ fn show_group_state(
     http: &reqwest::blocking::Client,
     worker: &WorkerSpec,
 ) -> Result<GroupStateSnapshot> {
-    let message =
-        send_cmd_expect_ok_fragment(http, worker, &Command::ShowGroupState, "group_id=")?;
+    let message = send_cmd_expect_ok_fragment(http, worker, &Command::ShowGroupState, "group_id=")?;
     parse_group_state_message(&message)
 }
 
@@ -574,10 +576,7 @@ fn app_sends_per_payload_for_plateau(
     if size < 2 {
         0
     } else {
-        cap_count(
-            app_rounds.saturating_mul(size),
-            max_app_samples_per_payload,
-        )
+        cap_count(app_rounds.saturating_mul(size), max_app_samples_per_payload)
     }
 }
 
@@ -589,6 +588,22 @@ fn app_ops_for_plateau(
 ) -> usize {
     app_sends_per_payload_for_plateau(size, app_rounds, max_app_samples_per_payload)
         .saturating_mul(payload_count)
+}
+
+fn sampled_member_index(member_count: usize, sample_count: usize, seq_no: usize) -> usize {
+    assert!(member_count > 0, "member_count must be greater than zero");
+    assert!(sample_count > 0, "sample_count must be greater than zero");
+
+    if sample_count >= member_count {
+        return seq_no % member_count;
+    }
+
+    let sample_no = seq_no % sample_count;
+    let one_based_index =
+        ((sample_no + 1) as u128 * member_count as u128 / sample_count as u128) as usize;
+
+    // Pick the right edge of each equal bucket: e.g. 20 / 4 => 5, 10, 15, 20.
+    one_based_index.saturating_sub(1)
 }
 
 fn estimate_total_units(
@@ -667,10 +682,15 @@ fn add_one_member(
     progress: &mut Progress,
 ) -> Result<()> {
     let timeout = Duration::from_secs(30);
-    let leader = active
-        .first()
-        .cloned()
-        .ok_or_else(|| anyhow!("No leader in active set"))?;
+
+    if active.is_empty() {
+        return Err(anyhow!(
+            "No active group member available to add new member"
+        ));
+    }
+
+    let actor_idx = thread_rng().gen_range(0..active.len());
+    let actor = active[actor_idx].clone();
 
     let joiner = idle
         .pop_front()
@@ -681,16 +701,15 @@ fn add_one_member(
 
     send_cmd_expect_ok_fragment(
         http,
-        &leader,
+        &actor,
         &Command::AddMembers {
             members: vec![joiner.id.clone()],
         },
         "added locally in one commit",
     )?;
-
     send_cmd_expect_ok_fragment(
         http,
-        &leader,
+        &actor,
         &Command::ReceiveCommit,
         "own commit accepted from DS",
     )?;
@@ -705,7 +724,11 @@ fn add_one_member(
         timeout,
     )?;
 
-    for other in active.iter().skip(1) {
+    for (idx, other) in active.iter().enumerate() {
+        if idx == actor_idx {
+            continue;
+        }
+
         send_cmd_expect_ok_fragment(
             http,
             other,
@@ -715,7 +738,7 @@ fn add_one_member(
     }
 
     active.push(joiner.clone());
-    progress.tick(&format!("add {}", joiner.id));
+    progress.tick(&format!("add {} actor={}", joiner.id, actor.id));
     Ok(())
 }
 
@@ -729,15 +752,23 @@ fn remove_one_member(
         return Err(anyhow!("Cannot remove the last remaining member"));
     }
 
-    let leader = active[0].clone();
-    let removed = active
-        .last()
-        .cloned()
-        .ok_or_else(|| anyhow!("No removable worker found"))?;
+    let mut rng = thread_rng();
+
+    let actor_idx = rng.gen_range(0..active.len());
+    let actor = active[actor_idx].clone();
+
+    // Pick a random member to remove, but do not let the actor remove itself.
+    // Self-removal is possible in MLS-style flows, but it complicates this benchmark's bookkeeping.
+    let mut removed_idx = rng.gen_range(0..active.len() - 1);
+    if removed_idx >= actor_idx {
+        removed_idx += 1;
+    }
+
+    let removed = active[removed_idx].clone();
 
     send_cmd_expect_ok_fragment(
         http,
-        &leader,
+        &actor,
         &Command::RemoveMembers {
             members: vec![removed.id.clone()],
         },
@@ -746,12 +777,16 @@ fn remove_one_member(
 
     send_cmd_expect_ok_fragment(
         http,
-        &leader,
+        &actor,
         &Command::ReceiveCommit,
         "own commit accepted from DS",
     )?;
 
-    for other in active.iter().skip(1) {
+    for other in active.iter() {
+        if other.id == actor.id {
+            continue;
+        }
+
         send_cmd_expect_ok_fragment(
             http,
             other,
@@ -760,12 +795,13 @@ fn remove_one_member(
         )?;
     }
 
-    let actually_removed = active
-        .pop()
-        .ok_or_else(|| anyhow!("Active set unexpectedly empty during removal"))?;
+    let actually_removed = active.remove(removed_idx);
     idle.push_front(actually_removed.clone());
 
-    progress.tick(&format!("remove {}", actually_removed.id));
+    progress.tick(&format!(
+        "remove {} actor={}",
+        actually_removed.id, actor.id
+    ));
     Ok(())
 }
 
@@ -795,11 +831,8 @@ fn run_update_phase(
     max_update_samples_per_plateau: usize,
     progress: &mut Progress,
 ) -> Result<()> {
-    let total_updates = update_ops_for_plateau(
-        plateau_size,
-        update_rounds,
-        max_update_samples_per_plateau,
-    );
+    let total_updates =
+        update_ops_for_plateau(plateau_size, update_rounds, max_update_samples_per_plateau);
     if total_updates == 0 {
         return Ok(());
     }
@@ -810,7 +843,7 @@ fn run_update_phase(
     );
 
     for seq_no in 0..total_updates {
-        let actor_idx = seq_no % active.len();
+        let actor_idx = sampled_member_index(active.len(), total_updates, seq_no);
         let actor = &active[actor_idx];
 
         send_cmd_expect_ok_fragment(
@@ -869,11 +902,8 @@ fn run_application_phase(
         return Ok(());
     }
 
-    let per_payload_count = app_sends_per_payload_for_plateau(
-        plateau_size,
-        app_rounds,
-        max_app_samples_per_payload,
-    );
+    let per_payload_count =
+        app_sends_per_payload_for_plateau(plateau_size, app_rounds, max_app_samples_per_payload);
     if per_payload_count == 0 {
         return Ok(());
     }
@@ -885,15 +915,10 @@ fn run_application_phase(
         );
 
         for seq_no in 0..per_payload_count {
-            let actor_idx = seq_no % active.len();
+            let actor_idx = sampled_member_index(active.len(), per_payload_count, seq_no);
             let actor = &active[actor_idx];
-            let payload = deterministic_payload(
-                payload_size,
-                plateau_size,
-                payload_size,
-                seq_no,
-                &actor.id,
-            );
+            let payload =
+                deterministic_payload(payload_size, plateau_size, payload_size, seq_no, &actor.id);
 
             send_cmd_expect_ok_fragment(
                 http,
@@ -902,11 +927,11 @@ fn run_application_phase(
                 "application message broadcast to group",
             )?;
 
-            let recipient_indices: Vec<usize> = (0..active.len())
-                .filter(|&j| j != actor_idx)
-                .collect();
+            let recipient_indices: Vec<usize> =
+                (0..active.len()).filter(|&j| j != actor_idx).collect();
 
-            let sampled_pos = seq_no % recipient_indices.len();
+            let sampled_pos =
+                sampled_member_index(recipient_indices.len(), per_payload_count, seq_no);
 
             for (pos, recipient_idx) in recipient_indices.iter().enumerate() {
                 let worker = &active[*recipient_idx];
@@ -954,7 +979,7 @@ fn aggregate_csv(run_dir: &Path, worker_ids: &[String]) -> Result<()> {
         group_epoch: Option<u64>,
         tree_size: Option<u32>,
         member_count: Option<usize>,
-        invitee_count: Option<usize>,
+        invitee_count: Option<isize>,
         ciphersuite: Option<String>,
         app_msg_plaintext_bytes: Option<usize>,
         app_msg_padding_bytes: Option<usize>,
@@ -1058,4 +1083,39 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
     }
 
     Ok(max_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sampled_member_index;
+
+    fn sampled_indices(member_count: usize, sample_count: usize) -> Vec<usize> {
+        (0..sample_count)
+            .map(|seq_no| sampled_member_index(member_count, sample_count, seq_no))
+            .collect()
+    }
+
+    #[test]
+    fn samples_every_member_when_sample_count_covers_group() {
+        assert_eq!(sampled_indices(16, 16), (0..16).collect::<Vec<_>>());
+        assert_eq!(
+            sampled_indices(5, 16),
+            vec![0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0, 1, 2, 3, 4, 0]
+        );
+    }
+
+    #[test]
+    fn samples_equal_bucket_right_edges_when_group_exceeds_sample_count() {
+        assert_eq!(sampled_indices(20, 4), vec![4, 9, 14, 19]);
+        assert_eq!(sampled_indices(100, 4), vec![24, 49, 74, 99]);
+    }
+
+    #[test]
+    fn includes_last_member_when_sampling_large_group() {
+        let indices = sampled_indices(100, 16);
+
+        assert_eq!(indices.last(), Some(&99));
+        assert!(indices.iter().all(|&idx| idx < 100));
+        assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    }
 }

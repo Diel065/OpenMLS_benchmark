@@ -32,7 +32,8 @@ impl DeliveryService {
     }
 
     pub fn publish_key_package(&mut self, owner: &str, key_package_bytes: Vec<u8>) {
-        self.key_packages.insert(owner.to_string(), key_package_bytes);
+        self.key_packages
+            .insert(owner.to_string(), key_package_bytes);
     }
 
     pub fn fetch_key_package(&mut self, owner: &str) -> Option<Vec<u8>> {

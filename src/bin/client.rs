@@ -81,7 +81,13 @@ fn main() -> Result<()> {
             }
         };
 
-        match handle_command(&mut client, &ds_url, &relay_url, &mut queued_intent, command) {
+        match handle_command(
+            &mut client,
+            &ds_url,
+            &relay_url,
+            &mut queued_intent,
+            command,
+        ) {
             Ok(message) => print_response_ok(&message),
             Err(err) => print_response_error(&err.to_string()),
         }

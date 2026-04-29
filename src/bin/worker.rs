@@ -93,7 +93,7 @@ async fn run_command(
             Err(err) => CommandResponse::error(err.to_string()),
         }
     })
-        .await;
+    .await;
 
     match result {
         Ok(response) => Json(response),
@@ -104,7 +104,7 @@ async fn run_command(
     }
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let (name, ds_url, relay_url, listen_addr) = parse_args()?;
 

@@ -73,7 +73,8 @@ impl Client {
     }
 
     fn hex_encode(bytes: &[u8]) -> String {
-        bytes.iter()
+        bytes
+            .iter()
             .map(|b| format!("{:02x}", b))
             .collect::<Vec<_>>()
             .join("")
@@ -191,9 +192,9 @@ impl Client {
                 .as_ref()
                 .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-            group.members().any(|member| {
-                member.credential.serialized_content() == self.name.as_bytes()
-            })
+            group
+                .members()
+                .any(|member| member.credential.serialized_content() == self.name.as_bytes())
         };
 
         if still_member {
@@ -235,11 +236,8 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-        let (commit_message, welcome_message, _group_info) = group.add_members(
-            &self.crypto,
-            &self.signature_keypair,
-            &key_packages,
-        )?;
+        let (commit_message, welcome_message, _group_info) =
+            group.add_members(&self.crypto, &self.signature_keypair, &key_packages)?;
 
         self.store_pending_epoch_change(
             commit_message,
@@ -280,11 +278,8 @@ impl Client {
             .as_mut()
             .ok_or_else(|| anyhow!("Client is not in a group"))?;
 
-        let (commit_message, _welcome_option, _group_info) = group.remove_members(
-            &self.crypto,
-            &self.signature_keypair,
-            &target_indices,
-        )?;
+        let (commit_message, _welcome_option, _group_info) =
+            group.remove_members(&self.crypto, &self.signature_keypair, &target_indices)?;
 
         self.store_pending_epoch_change(commit_message, None, Vec::new())
     }
@@ -345,7 +340,7 @@ impl Client {
             welcome,
             Some(ratchet_tree),
         )?
-            .into_group(&self.crypto)?;
+        .into_group(&self.crypto)?;
 
         self.group = Some(group);
         Ok(())

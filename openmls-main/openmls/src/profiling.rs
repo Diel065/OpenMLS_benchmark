@@ -75,7 +75,7 @@ pub(crate) struct ProfileEvent {
     pub group_epoch: Option<u64>,
     pub tree_size: Option<u32>,
     pub member_count: Option<usize>,
-    pub invitee_count: Option<usize>,
+    pub invitee_count: Option<isize>,
     pub ciphersuite: Option<String>,
 
     pub app_msg_plaintext_bytes: Option<usize>,

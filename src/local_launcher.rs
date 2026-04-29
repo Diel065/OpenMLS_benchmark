@@ -134,7 +134,9 @@ pub fn launch_local_stack(config: &LocalLaunchConfig) -> Result<LocalDeployment>
             .stdout(Stdio::from(worker_log))
             .stderr(Stdio::from(worker_log_err))
             .spawn()
-            .with_context(|| format!("Could not spawn worker binary at {}", worker_bin.display()))?;
+            .with_context(|| {
+                format!("Could not spawn worker binary at {}", worker_bin.display())
+            })?;
 
         workers.push(WorkerSpec {
             id,
@@ -159,7 +161,10 @@ fn derive_relay_listen_addr(ds_listen_addr: SocketAddr) -> Result<SocketAddr> {
         .checked_add(1000)
         .ok_or_else(|| anyhow!("Relay port overflow from DS port {}", ds_listen_addr.port()))?;
 
-    Ok(SocketAddr::new(ip_for_relay(ds_listen_addr.ip()), relay_port))
+    Ok(SocketAddr::new(
+        ip_for_relay(ds_listen_addr.ip()),
+        relay_port,
+    ))
 }
 
 fn ip_for_relay(ip: IpAddr) -> IpAddr {
