@@ -42,6 +42,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--ds-port", type=int, default=3000)
     p.add_argument("--relay-port", type=int, default=4000)
 
+    p.add_argument(
+        "--bridge-count",
+        type=int,
+        default=1,
+        help=(
+            "Number of Docker bridge networks to distribute workers across. "
+            "Passed through to scripts/generate_compose.py."
+        ),
+    )
+
     p.add_argument("--health-timeout-seconds", type=int, default=90)
     p.add_argument("--health-poll-seconds", type=float, default=0.5)
 
@@ -278,11 +288,16 @@ def docker_cleanup_mls_containers(root: Path) -> None:
 
     container_ids = [line.strip() for line in result.stdout.splitlines() if line.strip()]
     if container_ids:
-        subprocess.run(
-            ["docker", "rm", "-f", *container_ids],
-            cwd=str(root),
-            check=False,
-        )
+        print(f"[cleanup] removing {len(container_ids)} old mls-* containers")
+
+        for batch in chunks(container_ids, 64):
+            subprocess.run(
+                ["docker", "rm", "-f", *batch],
+                cwd=str(root),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
 
     network_result = subprocess.run(
         ["docker", "network", "ls", "--format", "{{.Name}}"],
@@ -292,17 +307,24 @@ def docker_cleanup_mls_containers(root: Path) -> None:
         text=True,
         check=False,
     )
+
     network_names = [
         line.strip()
         for line in network_result.stdout.splitlines()
         if line.strip().startswith("mls-")
     ]
+
     if network_names:
-        subprocess.run(
-            ["docker", "network", "rm", *network_names],
-            cwd=str(root),
-            check=False,
-        )
+        print(f"[cleanup] removing {len(network_names)} old mls-* networks")
+
+        for batch in chunks(network_names, 32):
+            subprocess.run(
+                ["docker", "network", "rm", *batch],
+                cwd=str(root),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
 
 
 def write_compose_logs(root: Path, compose_file: Path, dest: Path, append: bool = False) -> None:
@@ -316,6 +338,7 @@ def write_compose_logs(root: Path, compose_file: Path, dest: Path, append: bool 
             check=False,
             text=True,
         )
+
 
 def worker_service_names(worker_count: int) -> list[str]:
     return [f"worker-{i:05d}" for i in range(1, worker_count + 1)]
@@ -444,12 +467,19 @@ def compose_down(
         check=False,
     )
 
+
 def main() -> int:
     args = build_parser().parse_args()
     root = repo_root()
 
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+
+    if args.bridge_count < 1:
+        raise SystemExit("--bridge-count must be at least 1")
+
+    if args.bridge_count > args.workers:
+        raise SystemExit("--bridge-count must not exceed --workers")
 
     if args.startup_batch_size < 0:
         raise SystemExit("--startup-batch-size must be >= 0")
@@ -544,6 +574,8 @@ def main() -> int:
             str(args.ds_port),
             "--relay-port",
             str(args.relay_port),
+            "--bridge-count",
+            str(args.bridge_count),
         ]
 
         if args.runner_in_docker:

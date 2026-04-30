@@ -25,6 +25,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--relay-port", type=int, default=4000, help="Published relay port")
 
     p.add_argument(
+        "--bridge-count",
+        type=int,
+        default=1,
+        help=(
+            "Number of Docker bridge networks to distribute workers across. "
+            "Workers are assigned as evenly as possible across these bridges."
+        ),
+    )
+
+    p.add_argument(
         "--publish-workers",
         action="store_true",
         help="Publish every worker on a host port. Disable this for large runs.",
@@ -47,9 +57,29 @@ def service_name(i: int) -> str:
     return f"worker-{worker_id(i)}"
 
 
+def bridge_name(i: int) -> str:
+    return f"bench-net-{i:03d}"
+
+
+def bridge_names(args: argparse.Namespace) -> list[str]:
+    return [bridge_name(i) for i in range(args.bridge_count)]
+
+
+def worker_bridge_index(args: argparse.Namespace, worker_index: int) -> int:
+    return ((worker_index - 1) * args.bridge_count) // args.workers
+
+
+def worker_bridge_name(args: argparse.Namespace, worker_index: int) -> str:
+    return bridge_name(worker_bridge_index(args, worker_index))
+
+
 def validate_args(args: argparse.Namespace) -> None:
     if args.workers < 1:
         raise SystemExit("--workers must be at least 1")
+    if args.bridge_count < 1:
+        raise SystemExit("--bridge-count must be at least 1")
+    if args.bridge_count > args.workers:
+        raise SystemExit("--bridge-count must not exceed --workers")
     if not (1 <= args.base_worker_port <= 65535):
         raise SystemExit("--base-worker-port must be between 1 and 65535")
     if not (1 <= args.ds_port <= 65535):
@@ -67,6 +97,7 @@ def validate_args(args: argparse.Namespace) -> None:
 
 def generate_compose_text(args: argparse.Namespace) -> str:
     lines: list[str] = []
+    bridges = bridge_names(args)
 
     lines.append(f"name: {args.project_name}")
     lines.append("")
@@ -88,6 +119,9 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append(f'    command: ["--listen-addr", "0.0.0.0:{args.ds_port}"]')
     lines.append("    ports:")
     lines.append(f'      - "{args.ds_port}:{args.ds_port}"')
+    lines.append("    networks:")
+    for bridge in bridges:
+        lines.append(f"      - {bridge}")
     lines.append("")
 
     lines.append("  relay:")
@@ -95,6 +129,9 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append(f'    command: ["--listen-addr", "0.0.0.0:{args.relay_port}"]')
     lines.append("    ports:")
     lines.append(f'      - "{args.relay_port}:{args.relay_port}"')
+    lines.append("    networks:")
+    for bridge in bridges:
+        lines.append(f"      - {bridge}")
 
     for i in range(1, args.workers + 1):
         wid = worker_id(i)
@@ -122,6 +159,9 @@ def generate_compose_text(args: argparse.Namespace) -> str:
             lines.append("    ports:")
             lines.append(f'      - "{host_port}:8080"')
 
+        lines.append("    networks:")
+        lines.append(f"      - {worker_bridge_name(args, i)}")
+
     # Important: this block must be OUTSIDE the worker loop.
     # Otherwise the generated compose file gets one duplicate runner service per worker.
     if args.include_runner:
@@ -133,6 +173,15 @@ def generate_compose_text(args: argparse.Namespace) -> str:
         lines.append("      - relay")
         lines.append("    volumes:")
         lines.append(f"      - ./{args.output_dir}:/results")
+        lines.append("    networks:")
+        for bridge in bridges:
+            lines.append(f"      - {bridge}")
+
+    lines.append("")
+    lines.append("networks:")
+    for bridge in bridges:
+        lines.append(f"  {bridge}:")
+        lines.append("    driver: bridge")
 
     return "\n".join(lines) + "\n"
 
@@ -179,6 +228,7 @@ def main() -> None:
     print("")
     print("What you generated:")
     print(f"- Compose file with {args.workers} workers")
+    print(f"- workers distributed across {args.bridge_count} Docker bridge network(s)")
     print("- workers.txt for an in-network runner")
     print("- workers.host.txt for the host-runner workflow")
 
