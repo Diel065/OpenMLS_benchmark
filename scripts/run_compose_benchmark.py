@@ -650,16 +650,21 @@ def main() -> int:
                 f"Original error: {e}"
             ) from e
 
+        print(f"[health] waiting for ds on http://127.0.0.1:{args.ds_port}/health", flush=True)
         wait_for_health(
             f"http://127.0.0.1:{args.ds_port}/health",
             args.health_timeout_seconds,
             args.health_poll_seconds,
         )
+        print("[health] ds ok", flush=True)
+
+        print(f"[health] waiting for relay on http://127.0.0.1:{args.relay_port}/health", flush=True)
         wait_for_health(
             f"http://127.0.0.1:{args.relay_port}/health",
             args.health_timeout_seconds,
             args.health_poll_seconds,
         )
+        print("[health] relay ok", flush=True)
 
         if args.runner_in_docker:
             print("[health] skipping host worker health checks; runner will check workers inside Docker network")
@@ -748,6 +753,9 @@ def main() -> int:
                 output_dir_name,
             ]
 
+        print("[runner] starting benchmark runner", flush=True)
+        print("[runner] " + " ".join(benchmark_cmd), flush=True)
+
         exit_code = tee_subprocess_output(
             benchmark_cmd,
             cwd=root,
@@ -765,6 +773,15 @@ def main() -> int:
         print(f"Run complete: {run_id}")
         print(f"Results: {run_dir}")
         return 0
+
+    except Exception as e:
+        print(
+            f"[error] benchmark orchestration failed before cleanup: "
+            f"{type(e).__name__}: {e}",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise
 
     finally:
         if compose_up:
