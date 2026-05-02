@@ -245,6 +245,10 @@ while true; do
 done
 """
 
+    # Docker Compose interpolates $VAR inside YAML values before the shell sees it.
+    # Escape shell dollars so the netcheck container receives the script unchanged.
+    monitor_script = monitor_script.replace("$", "$$")
+
     lines.append("")
     lines.append("  netcheck:")
     lines.append("    image: nicolaka/netshoot:latest")
