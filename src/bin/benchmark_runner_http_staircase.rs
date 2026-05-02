@@ -22,6 +22,9 @@ struct Args {
     #[arg(long)]
     workers_file: Option<String>,
 
+    #[arg(long, default_value_t = false)]
+    preflight_only: bool,
+
     #[arg(long, default_value_t = 2)]
     min_size: usize,
 
@@ -61,6 +64,12 @@ struct Args {
 
     #[arg(long, default_value = "benchmark_output")]
     output_dir: String,
+
+    #[arg(long, default_value_t = 300)]
+    worker_health_timeout_seconds: u64,
+
+    #[arg(long, default_value_t = 250)]
+    worker_health_poll_ms: u64,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -107,6 +116,7 @@ fn main() -> Result<()> {
     let workers = parse_worker_specs(&worker_specs)?;
 
     run_staircase_benchmark(StaircaseConfig {
+        preflight_only: args.preflight_only,
         ds_url: args.ds_url,
         workers,
         min_size: args.min_size,
@@ -121,5 +131,7 @@ fn main() -> Result<()> {
         run_id: args.run_id,
         scenario: args.scenario,
         output_dir: args.output_dir,
+        worker_health_timeout_seconds: args.worker_health_timeout_seconds,
+        worker_health_poll_ms: args.worker_health_poll_ms,
     })
 }

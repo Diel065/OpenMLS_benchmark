@@ -11,6 +11,9 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     spawn_local_workers: usize,
 
+    #[arg(long, default_value_t = false)]
+    preflight_only: bool,
+
     #[arg(long, default_value = "127.0.0.1:3000")]
     ds_listen_addr: SocketAddr,
 
@@ -75,6 +78,7 @@ fn main() -> Result<()> {
     })?;
 
     run_staircase_benchmark(StaircaseConfig {
+        preflight_only: args.preflight_only,
         ds_url: deployment.ds_url.clone(),
         workers: deployment.workers.clone(),
         min_size: args.min_size,
@@ -86,6 +90,8 @@ fn main() -> Result<()> {
         max_update_samples_per_plateau: args.max_update_samples_per_plateau,
         max_app_samples_per_payload: args.max_app_samples_per_payload,
         payload_sizes: args.payload_sizes,
+        worker_health_timeout_seconds: 300,
+        worker_health_poll_ms: 250,
         run_id: args.run_id,
         scenario: args.scenario,
         output_dir: args.output_dir,

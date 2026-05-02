@@ -56,6 +56,42 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--health-poll-seconds", type=float, default=0.5)
 
     p.add_argument(
+        "--post-startup-settle-seconds",
+        type=float,
+        default=0.0,
+        help=(
+            "Sleep this many seconds after all containers are started, "
+            "before starting health checks / runner. Useful for large Docker stacks."
+        ),
+    )
+
+    p.add_argument(
+        "--worker-health-timeout-seconds",
+        type=int,
+        default=300,
+        help=(
+            "How long the in-network benchmark runner should wait for all workers "
+            "to become healthy before starting MLS logic."
+        ),
+    )
+
+    p.add_argument(
+        "--worker-health-poll-ms",
+        type=int,
+        default=250,
+        help="Polling interval in milliseconds for in-network worker health checks.",
+    )
+
+    p.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help=(
+            "Only check DS/relay/worker reachability from inside the Docker network, "
+            "then exit without running the MLS benchmark. No events.csv is expected."
+        ),
+    )
+
+    p.add_argument(
         "--startup-batch-size",
         type=int,
         default=0,
@@ -499,6 +535,15 @@ def main() -> int:
     if args.teardown_batch_sleep_seconds < 0:
         raise SystemExit("--teardown-batch-sleep-seconds must be >= 0")
 
+    if args.post_startup_settle_seconds < 0:
+        raise SystemExit("--post-startup-settle-seconds must be >= 0")
+
+    if args.worker_health_timeout_seconds < 1:
+        raise SystemExit("--worker-health-timeout-seconds must be >= 1")
+
+    if args.worker_health_poll_ms < 1:
+        raise SystemExit("--worker-health-poll-ms must be >= 1")
+
     run_id = args.run_id or timestamped_run_id(args.workers)
     scenario = args.scenario
     output_dir_name = args.output_dir
@@ -583,6 +628,8 @@ def main() -> int:
         else:
             generator_cmd.append("--publish-workers")
 
+        generator_cmd.append("--include-netcheck")
+
         run_cmd(generator_cmd, cwd=root)
 
         copy_if_exists(compose_tmp, run_dir / "docker-compose.generated.yml")
@@ -650,6 +697,14 @@ def main() -> int:
                 f"Original error: {e}"
             ) from e
 
+        if args.post_startup_settle_seconds > 0:
+            print(
+                f"[compose] settling for {args.post_startup_settle_seconds:.1f}s "
+                "before health checks",
+                flush=True,
+            )
+            time.sleep(args.post_startup_settle_seconds)
+
         print(f"[health] waiting for ds on http://127.0.0.1:{args.ds_port}/health", flush=True)
         wait_for_health(
             f"http://127.0.0.1:{args.ds_port}/health",
@@ -665,6 +720,14 @@ def main() -> int:
             args.health_poll_seconds,
         )
         print("[health] relay ok", flush=True)
+
+        print("[netcheck] starting continuous network monitor", flush=True)
+        run_cmd(
+            ["docker", "compose", "-f", str(compose_tmp), "up", "-d", "netcheck"],
+            cwd=root,
+            env=compose_env,
+        )
+        print(f"[netcheck] writing continuous log to {run_dir / 'netcheck.log'}", flush=True)
 
         if args.runner_in_docker:
             print("[health] skipping host worker health checks; runner will check workers inside Docker network")
@@ -709,6 +772,11 @@ def main() -> int:
                 str(args.max_app_samples_per_payload),
                 "--payload-sizes",
                 args.payload_sizes,
+                "--worker-health-timeout-seconds",
+                str(args.worker_health_timeout_seconds),
+                "--worker-health-poll-ms",
+                str(args.worker_health_poll_ms),
+                *(["--preflight-only"] if args.preflight_only else []),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -745,6 +813,11 @@ def main() -> int:
                 str(args.max_app_samples_per_payload),
                 "--payload-sizes",
                 args.payload_sizes,
+                "--worker-health-timeout-seconds",
+                str(args.worker_health_timeout_seconds),
+                "--worker-health-poll-ms",
+                str(args.worker_health_poll_ms),
+                *(["--preflight-only"] if args.preflight_only else []),
                 "--run-id",
                 run_id,
                 "--scenario",
@@ -766,7 +839,11 @@ def main() -> int:
         if exit_code != 0:
             raise RuntimeError(f"Benchmark runner exited with code {exit_code}")
 
-        validate_artifacts(run_dir)
+        if not args.preflight_only:
+            validate_artifacts(run_dir)
+        else:
+            print("[preflight] skipping artifact validation because --preflight-only was used")
+
         write_compose_logs(root, compose_tmp, compose_logs_path, append=False)
 
         print("")

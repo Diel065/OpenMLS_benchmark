@@ -15,6 +15,7 @@ use crate::worker_api::{Command, CommandResponse};
 
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
+    pub preflight_only: bool,
     pub ds_url: String,
     pub workers: Vec<WorkerSpec>,
     pub min_size: usize,
@@ -29,6 +30,8 @@ pub struct StaircaseConfig {
     pub run_id: String,
     pub scenario: String,
     pub output_dir: String,
+    pub worker_health_timeout_seconds: u64,
+    pub worker_health_poll_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -71,6 +74,7 @@ struct ProfileEvent {
     scenario: Option<String>,
     node_name: Option<String>,
     pod_name: Option<String>,
+
 }
 
 struct Progress {
@@ -175,9 +179,25 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
     wait_for_health(&http, &config.ds_url, Duration::from_secs(10))
         .with_context(|| format!("DS at {} is not healthy", config.ds_url))?;
 
-    for worker in &config.workers {
-        wait_for_health(&http, &worker.url, Duration::from_secs(10))
-            .with_context(|| format!("Worker {} at {} is not healthy", worker.id, worker.url))?;
+    let worker_health_timeout = Duration::from_secs(config.worker_health_timeout_seconds);
+    let worker_health_poll = Duration::from_millis(config.worker_health_poll_ms);
+
+    eprintln!(
+        "[preflight] waiting up to {} for {} workers to become healthy",
+        format_hms(worker_health_timeout),
+        config.workers.len()
+    );
+
+    wait_for_all_workers_healthy(
+        &http,
+        &config.workers,
+        worker_health_timeout,
+        worker_health_poll,
+    )?;
+
+    if config.preflight_only {
+        eprintln!("[preflight] preflight-only mode complete; skipping MLS benchmark logic");
+        return Ok(());
     }
 
     let plateau_sequence = build_plateau_sequence(
@@ -322,6 +342,80 @@ fn wait_for_health(
     }
 
     Err(anyhow!("Timeout waiting for health endpoint at {}", url))
+}
+
+fn wait_for_all_workers_healthy(
+    http: &reqwest::blocking::Client,
+    workers: &[WorkerSpec],
+    timeout: Duration,
+    poll: Duration,
+) -> Result<()> {
+    let start = Instant::now();
+    let mut remaining: Vec<usize> = (0..workers.len()).collect();
+    let mut last_report = Instant::now();
+
+    while start.elapsed() < timeout {
+        let mut still_unhealthy = Vec::new();
+
+        for &idx in &remaining {
+            let worker = &workers[idx];
+            let url = format!("{}/health", worker.url.trim_end_matches('/'));
+
+            match http.get(&url).send() {
+                Ok(resp) if resp.status().is_success() => {}
+                _ => still_unhealthy.push(idx),
+            }
+        }
+
+        let healthy_count = workers.len().saturating_sub(still_unhealthy.len());
+
+        if still_unhealthy.is_empty() {
+            eprintln!(
+                "[preflight] all {} workers are healthy after {}",
+                workers.len(),
+                format_hms(start.elapsed())
+            );
+            return Ok(());
+        }
+
+        if last_report.elapsed() >= Duration::from_secs(5) {
+            let examples: Vec<String> = still_unhealthy
+                .iter()
+                .take(10)
+                .map(|&idx| workers[idx].id.clone())
+                .collect();
+
+            eprintln!(
+                "[preflight] {}/{} workers healthy; still waiting for {}. Examples: {:?}",
+                healthy_count,
+                workers.len(),
+                still_unhealthy.len(),
+                examples
+            );
+
+            last_report = Instant::now();
+        }
+
+        remaining = still_unhealthy;
+        thread::sleep(poll);
+    }
+
+    let examples: Vec<String> = remaining
+        .iter()
+        .take(25)
+        .map(|&idx| {
+            let worker = &workers[idx];
+            format!("{}={}", worker.id, worker.url)
+        })
+        .collect();
+
+    Err(anyhow!(
+        "Timeout waiting for worker readiness after {}. {}/{} workers still unhealthy. Examples: {:?}",
+        format_hms(timeout),
+        remaining.len(),
+        workers.len(),
+        examples
+    ))
 }
 
 fn send_command(
