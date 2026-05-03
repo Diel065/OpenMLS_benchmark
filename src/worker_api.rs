@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::{HashMap, VecDeque},
+    time::{Duration, Instant},
+};
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::future::try_join_all;
@@ -26,6 +29,66 @@ pub enum Command {
     ShowGroupState,
 }
 
+impl Command {
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Command::CreateGroup => "CreateGroup",
+            Command::GenerateKeyPackage => "GenerateKeyPackage",
+            Command::AddMembers { .. } => "AddMembers",
+            Command::JoinFromWelcome => "JoinFromWelcome",
+            Command::SendApplicationMessage { .. } => "SendApplicationMessage",
+            Command::ReceiveApplicationMessage { .. } => "ReceiveApplicationMessage",
+            Command::SelfUpdate => "SelfUpdate",
+            Command::RemoveMembers { .. } => "RemoveMembers",
+            Command::ReceiveCommit => "ReceiveCommit",
+            Command::ShowGroupState => "ShowGroupState",
+        }
+    }
+
+    pub fn is_mls_mutating(&self) -> bool {
+        matches!(
+            self,
+            Command::CreateGroup
+                | Command::AddMembers { .. }
+                | Command::JoinFromWelcome
+                | Command::SelfUpdate
+                | Command::RemoveMembers { .. }
+                | Command::ReceiveCommit
+        )
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CommandRequestEnvelope {
+    pub request_id: String,
+    pub command: Command,
+    #[serde(default)]
+    pub expected_epoch: Option<u64>,
+    #[serde(default)]
+    pub phase: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum IncomingCommandRequest {
+    Envelope(CommandRequestEnvelope),
+    Raw(Command),
+}
+
+impl IncomingCommandRequest {
+    pub fn into_parts(self) -> (Option<String>, Command, Option<u64>, Option<String>) {
+        match self {
+            IncomingCommandRequest::Envelope(envelope) => (
+                Some(envelope.request_id),
+                envelope.command,
+                envelope.expected_epoch,
+                envelope.phase,
+            ),
+            IncomingCommandRequest::Raw(command) => (None, command, None, None),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResponse {
     pub status: String,
@@ -48,6 +111,90 @@ impl CommandResponse {
     }
 }
 
+#[derive(Debug, Clone)]
+struct CachedCommandResponse {
+    response: CommandResponse,
+    completed_at: Instant,
+}
+
+#[derive(Debug)]
+pub struct CompletedCommandCache {
+    entries: HashMap<String, CachedCommandResponse>,
+    order: VecDeque<String>,
+    max_entries: usize,
+    ttl: Duration,
+}
+
+impl CompletedCommandCache {
+    pub fn new(max_entries: usize, ttl: Duration) -> Self {
+        Self {
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+            max_entries,
+            ttl,
+        }
+    }
+
+    pub fn get(&mut self, request_id: &str) -> Option<CommandResponse> {
+        self.prune_expired();
+        self.entries
+            .get(request_id)
+            .map(|cached| cached.response.clone())
+    }
+
+    pub fn insert(&mut self, request_id: String, response: CommandResponse) {
+        if self.max_entries == 0 {
+            return;
+        }
+
+        self.prune_expired();
+
+        if !self.entries.contains_key(&request_id) {
+            self.order.push_back(request_id.clone());
+        }
+
+        self.entries.insert(
+            request_id,
+            CachedCommandResponse {
+                response,
+                completed_at: Instant::now(),
+            },
+        );
+
+        while self.entries.len() > self.max_entries {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+    }
+
+    fn prune_expired(&mut self) {
+        if self.ttl.is_zero() {
+            self.entries.clear();
+            self.order.clear();
+            return;
+        }
+
+        let now = Instant::now();
+
+        while let Some(request_id) = self.order.front() {
+            let expired = self
+                .entries
+                .get(request_id)
+                .map(|cached| now.duration_since(cached.completed_at) > self.ttl)
+                .unwrap_or(true);
+
+            if !expired {
+                break;
+            }
+
+            let request_id = self.order.pop_front().expect("front checked above");
+            self.entries.remove(&request_id);
+        }
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct GroupStatePutRequest {
     members: Vec<String>,
@@ -63,6 +210,40 @@ pub enum PendingIntent {
         members: Vec<String>,
     },
     SelfUpdate,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn completed_command_cache_replays_same_request_once() {
+        let mut cache = CompletedCommandCache::new(8, Duration::from_secs(60));
+        let response = CommandResponse::ok("mutating command processed");
+
+        assert!(cache.get("req-1").is_none());
+
+        cache.insert("req-1".to_string(), response.clone());
+
+        let replayed = cache
+            .get("req-1")
+            .expect("cached response should be available");
+        assert_eq!(replayed.status, response.status);
+        assert_eq!(replayed.message, response.message);
+    }
+
+    #[test]
+    fn completed_command_cache_is_bounded() {
+        let mut cache = CompletedCommandCache::new(2, Duration::from_secs(60));
+
+        cache.insert("req-1".to_string(), CommandResponse::ok("one"));
+        cache.insert("req-2".to_string(), CommandResponse::ok("two"));
+        cache.insert("req-3".to_string(), CommandResponse::ok("three"));
+
+        assert!(cache.get("req-1").is_none());
+        assert!(cache.get("req-2").is_some());
+        assert!(cache.get("req-3").is_some());
+    }
 }
 
 pub enum DsPostResult {

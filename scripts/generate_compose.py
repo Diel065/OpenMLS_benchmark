@@ -115,6 +115,7 @@ set +e
 RUN_ID="{args.run_id}"
 OUT="/results/$RUN_ID/netcheck.log"
 WORKERS="/results/$RUN_ID/workers.txt"
+TARGETS="/results/$RUN_ID/netcheck_targets.txt"
 
 INTERVAL_SECONDS=5
 FULL_SCAN_EVERY_SECONDS=60
@@ -192,7 +193,7 @@ worker_scan() {{
         do_check=1
       fi
 
-      if [ $((total % 250)) -eq 0 ]; then
+      if [ $(((total + iteration) % 250)) -eq 0 ]; then
         do_check=1
       fi
     fi
@@ -217,6 +218,33 @@ worker_scan() {{
   log "WORKER_SCAN mode=$mode total_workers=$total checked=$checked healthy_checked=$healthy failed_checked=$failed"
 }}
 
+target_scan() {{
+  if [ ! -f "$TARGETS" ] || [ ! -f "$WORKERS" ]; then
+    return 0
+  fi
+
+  while read -r target_id; do
+    [ -z "$target_id" ] && continue
+    line=$(grep -E "^$target_id=" "$WORKERS" 2>/dev/null | head -n 1 || true)
+    if [ -z "$line" ]; then
+      log "TARGET_FAIL id=$target_id missing_from_workers_file=$WORKERS"
+      continue
+    fi
+
+    id=$(printf "%s" "$line" | cut -d= -f1)
+    url=$(printf "%s" "$line" | cut -d= -f2-)
+
+    if curl -fsS --connect-timeout 1 --max-time 3 "$url/health" >/dev/null; then
+      log "TARGET_OK id=$id url=$url"
+    else
+      rc=$?
+      host=$(printf "%s" "$url" | cut -d/ -f3 | cut -d: -f1)
+      dns=$(getent hosts "$host" 2>/dev/null || true)
+      log "TARGET_FAIL id=$id url=$url host=$host curl_exit=$rc dns=$dns"
+    fi
+  done < "$TARGETS"
+}}
+
 trap 'log "NETCHECK MONITOR RECEIVED STOP SIGNAL"; exit 0' TERM INT
 
 snapshot
@@ -239,6 +267,8 @@ while true; do
   else
     worker_scan sample
   fi
+
+  target_scan
 
   sleep "$INTERVAL_SECONDS" &
   wait $!
@@ -287,6 +317,11 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append("  environment:")
     lines.append(f"    OPENMLS_PROFILE_RUN_ID: {args.run_id}")
     lines.append(f"    OPENMLS_PROFILE_SCENARIO: {args.scenario}")
+    lines.append("    MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}")
+    lines.append("    OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}")
+    lines.append("    OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}")
+    lines.append("    OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}")
+    lines.append("    OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}")
     lines.append("  depends_on:")
     lines.append("    - ds")
     lines.append("    - relay")
@@ -338,6 +373,11 @@ def generate_compose_text(args: argparse.Namespace) -> str:
         lines.append(f"      OPENMLS_PROFILE_RUN_ID: {args.run_id}")
         lines.append(f"      OPENMLS_PROFILE_SCENARIO: {args.scenario}")
         lines.append(f"      OPENMLS_PROFILE_PATH: /results/{args.run_id}/client-{wid}.jsonl")
+        lines.append("      MLS_DEBUG_LOGS: ${MLS_DEBUG_LOGS:-}")
+        lines.append("      OPENMLS_WORKER_DEBUG_IDS: ${OPENMLS_WORKER_DEBUG_IDS:-}")
+        lines.append("      OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY: ${OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY:-}")
+        lines.append("      OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE:-}")
+        lines.append("      OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS: ${OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS:-}")
 
         if args.publish_workers:
             lines.append("    ports:")

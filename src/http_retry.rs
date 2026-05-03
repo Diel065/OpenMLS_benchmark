@@ -118,15 +118,29 @@ where
 }
 
 pub fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
-    if err.is_timeout() || err.is_connect() {
+    if err.is_timeout() || err.is_connect() || err.is_body() {
         return true;
     }
 
     let message = err.to_string().to_ascii_lowercase();
     message.contains("connection refused")
         || message.contains("connection reset")
+        || message.contains("connection reset by peer")
         || message.contains("connection closed")
         || message.contains("broken pipe")
+        || message.contains("error sending request")
+        || message.contains("error trying to connect")
+        || message.contains("operation timed out")
+        || message.contains("request timed out")
+        || message.contains("unexpected eof")
+        || message.contains("incomplete message")
+        || message.contains("channel closed")
+        || message.contains("dns error")
+        || message.contains("failed to lookup address information")
+        || message.contains("failed to resolve")
+        || message.contains("temporary failure in name resolution")
+        || message.contains("name or service not known")
+        || message.contains("nodename nor servname provided")
 }
 
 pub fn is_connect_stage_reqwest_error(err: &reqwest::Error) -> bool {

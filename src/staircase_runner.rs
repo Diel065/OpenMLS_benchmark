@@ -1,14 +1,16 @@
 use std::{
     collections::VecDeque,
+    error::Error as StdError,
     fs::{self, File},
     future::Future,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
+    sync::atomic::{AtomicU64, Ordering},
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::future::try_join_all;
+use futures_util::future::{join_all, try_join_all};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
@@ -16,13 +18,18 @@ use crate::http_retry::{
     is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
     retry_transient_http_async, RetryDecision,
 };
-use crate::worker_api::{Command, CommandResponse};
+use crate::worker_api::{Command, CommandRequestEnvelope, CommandResponse};
 
 const WORKER_COMMAND_MAX_ATTEMPTS: usize = 10;
 const WORKER_COMMAND_INITIAL_DELAY: Duration = Duration::from_millis(100);
 const WORKER_COMMAND_MAX_DELAY: Duration = Duration::from_secs(3);
 const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 32;
-const DEFAULT_MAX_FANOUT_PARALLELISM: usize = 128;
+const DEFAULT_MAX_FANOUT_PARALLELISM: usize = 32;
+const ADAPTIVE_FANOUT_START: usize = 32;
+const FANOUT_LATENCY_SPIKE_P95_MS: u128 = 5_000;
+const FANOUT_STABLE_INCREASE_AFTER: usize = 20;
+
+static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
@@ -44,6 +51,7 @@ pub struct StaircaseConfig {
     pub worker_health_timeout_seconds: u64,
     pub worker_health_poll_ms: u64,
     pub max_fanout_parallelism: usize,
+    pub fanout_adaptive: bool,
     pub http_pool_max_idle_per_host: usize,
 }
 
@@ -72,6 +80,10 @@ pub struct NetworkPhaseMetrics {
     pub retry_count: usize,
     pub retry_sleep_ms: u128,
     pub failures: usize,
+    pub worker_latency_p50_ms: Option<u128>,
+    pub worker_latency_p95_ms: Option<u128>,
+    pub worker_latency_p99_ms: Option<u128>,
+    pub worker_latency_max_ms: Option<u128>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -169,6 +181,120 @@ impl Progress {
     }
 }
 
+#[derive(Debug)]
+struct FanoutController {
+    max_parallelism: usize,
+    current_parallelism: usize,
+    adaptive: bool,
+    stable_successes: usize,
+}
+
+impl FanoutController {
+    fn new(max_parallelism: usize, adaptive: bool) -> Self {
+        let max_parallelism = max_parallelism.max(1);
+        let current_parallelism = if adaptive {
+            ADAPTIVE_FANOUT_START.min(max_parallelism).max(1)
+        } else {
+            max_parallelism
+        };
+
+        Self {
+            max_parallelism,
+            current_parallelism,
+            adaptive,
+            stable_successes: 0,
+        }
+    }
+
+    fn parallelism(&self) -> usize {
+        self.current_parallelism.max(1)
+    }
+
+    fn record(&mut self, phase: &str, operation: &str, summary: &FanoutSummary) {
+        if !self.adaptive {
+            return;
+        }
+
+        let p95 = summary.latency_p95_ms.unwrap_or(0);
+        let should_reduce = summary.failures > 0 || p95 >= FANOUT_LATENCY_SPIKE_P95_MS;
+
+        if should_reduce {
+            let previous = self.current_parallelism;
+            self.current_parallelism = (self.current_parallelism / 2).max(1);
+            self.stable_successes = 0;
+
+            if self.current_parallelism != previous {
+                eprintln!(
+                    "[fanout-adaptive] phase={} operation={} reducing parallelism {} -> {} failures={} p95_ms={}",
+                    phase,
+                    operation,
+                    previous,
+                    self.current_parallelism,
+                    summary.failures,
+                    p95
+                );
+            }
+            return;
+        }
+
+        self.stable_successes += 1;
+        if self.stable_successes >= FANOUT_STABLE_INCREASE_AFTER
+            && self.current_parallelism < self.max_parallelism
+        {
+            let previous = self.current_parallelism;
+            self.current_parallelism = (self.current_parallelism + 4).min(self.max_parallelism);
+            self.stable_successes = 0;
+
+            eprintln!(
+                "[fanout-adaptive] phase={} operation={} increasing parallelism {} -> {} p95_ms={}",
+                phase, operation, previous, self.current_parallelism, p95
+            );
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FanoutSummary {
+    request_count: usize,
+    failures: usize,
+    wall_ms: u128,
+    latency_p50_ms: Option<u128>,
+    latency_p95_ms: Option<u128>,
+    latency_p99_ms: Option<u128>,
+    latency_max_ms: Option<u128>,
+}
+
+#[derive(Debug, Clone)]
+struct ExpectedGroupState {
+    group_id: String,
+    epoch: u64,
+    members: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+enum ExpectedReceiveCommitState {
+    Group(ExpectedGroupState),
+    Removed { expected_epoch: u64 },
+}
+
+impl From<GroupStateSnapshot> for ExpectedGroupState {
+    fn from(snapshot: GroupStateSnapshot) -> Self {
+        Self {
+            group_id: snapshot.group_id,
+            epoch: snapshot.epoch,
+            members: snapshot.members,
+        }
+    }
+}
+
+impl ExpectedGroupState {
+    fn matches(&self, snapshot: &GroupStateSnapshot) -> bool {
+        snapshot.group_id == self.group_id
+            && snapshot.epoch == self.epoch
+            && snapshot.members == self.members
+    }
+}
+
 pub fn parse_worker_specs(raw_specs: &[String]) -> Result<Vec<WorkerSpec>> {
     let mut workers = Vec::with_capacity(raw_specs.len());
 
@@ -216,12 +342,16 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     fs::create_dir_all(&run_dir)?;
 
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
+    let mut fanout = FanoutController::new(max_fanout_parallelism, config.fanout_adaptive);
     let http_pool_max_idle_per_host =
         effective_http_pool_max_idle_per_host(config.http_pool_max_idle_per_host);
 
     eprintln!(
-        "[network] runner http_pool_max_idle_per_host={} max_fanout_parallelism={}",
-        http_pool_max_idle_per_host, max_fanout_parallelism
+        "[network] runner http_pool_max_idle_per_host={} max_fanout_parallelism={} fanout_adaptive={} initial_effective_fanout_parallelism={}",
+        http_pool_max_idle_per_host,
+        max_fanout_parallelism,
+        config.fanout_adaptive,
+        fanout.parallelism()
     );
 
     let http = reqwest::Client::builder()
@@ -314,7 +444,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             &mut active,
             &mut idle,
             target_size,
-            max_fanout_parallelism,
+            &mut fanout,
             &mut progress,
         )
         .await?;
@@ -332,7 +462,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             target_size,
             config.update_rounds,
             config.max_update_samples_per_plateau,
-            max_fanout_parallelism,
+            &mut fanout,
             &mut progress,
         )
         .await?;
@@ -351,7 +481,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             config.app_rounds,
             config.max_app_samples_per_payload,
             &config.payload_sizes,
-            max_fanout_parallelism,
+            &mut fanout,
             &mut progress,
         )
         .await?;
@@ -376,11 +506,7 @@ fn effective_max_fanout_parallelism(configured: usize) -> usize {
         return configured;
     }
 
-    let cpu_scaled = std::thread::available_parallelism()
-        .map(|threads| threads.get().saturating_mul(4))
-        .unwrap_or(16);
-
-    cpu_scaled.min(DEFAULT_MAX_FANOUT_PARALLELISM).max(1)
+    DEFAULT_MAX_FANOUT_PARALLELISM
 }
 
 fn effective_http_pool_max_idle_per_host(configured: usize) -> usize {
@@ -508,6 +634,10 @@ async fn wait_for_all_workers_healthy(
                 retry_count: 0,
                 retry_sleep_ms: 0,
                 failures: 0,
+                worker_latency_p50_ms: None,
+                worker_latency_p95_ms: None,
+                worker_latency_p99_ms: None,
+                worker_latency_max_ms: None,
             });
             return Ok(());
         }
@@ -554,6 +684,10 @@ async fn wait_for_all_workers_healthy(
         retry_count: 0,
         retry_sleep_ms: 0,
         failures: remaining.len(),
+        worker_latency_p50_ms: None,
+        worker_latency_p95_ms: None,
+        worker_latency_p99_ms: None,
+        worker_latency_max_ms: None,
     });
 
     Err(anyhow!(
@@ -565,99 +699,314 @@ async fn wait_for_all_workers_healthy(
     ))
 }
 
-async fn send_command(
+#[derive(Debug, Clone)]
+struct WorkerCommandContext {
+    request_id: String,
+    expected_epoch: Option<u64>,
+    phase: Option<String>,
+}
+
+impl WorkerCommandContext {
+    fn new(worker: &WorkerSpec, command: &Command) -> Self {
+        Self::with_metadata(worker, command, None, None)
+    }
+
+    fn with_metadata(
+        worker: &WorkerSpec,
+        command: &Command,
+        expected_epoch: Option<u64>,
+        phase: Option<&str>,
+    ) -> Self {
+        let seq = WORKER_COMMAND_REQUEST_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let request_id = format!(
+            "runner-{}-{}-{}-{}",
+            std::process::id(),
+            worker.id,
+            command.kind(),
+            seq
+        );
+
+        Self {
+            request_id,
+            expected_epoch,
+            phase: phase.map(ToOwned::to_owned),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkerCommandErrorClass {
+    TransportRetryable,
+    FatalHttpStatus,
+    FatalDecode,
+}
+
+impl WorkerCommandErrorClass {
+    fn as_str(self) -> &'static str {
+        match self {
+            WorkerCommandErrorClass::TransportRetryable => "transport-retryable",
+            WorkerCommandErrorClass::FatalHttpStatus => "fatal-http-status",
+            WorkerCommandErrorClass::FatalDecode => "fatal-decode",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct WorkerCommandError {
+    worker_id: String,
+    command: &'static str,
+    url: String,
+    request_id: String,
+    attempts: usize,
+    classification: WorkerCommandErrorClass,
+    last_error: String,
+    diagnostic: Option<String>,
+}
+
+impl WorkerCommandError {
+    fn is_ambiguous_transport(&self) -> bool {
+        self.classification == WorkerCommandErrorClass::TransportRetryable
+    }
+}
+
+impl std::fmt::Display for WorkerCommandError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "runner.worker_command failed: worker={} command={} url={} request_id={} attempts={} classification={} last_error={}",
+            self.worker_id,
+            self.command,
+            self.url,
+            self.request_id,
+            self.attempts,
+            self.classification.as_str(),
+            self.last_error
+        )?;
+
+        if let Some(diagnostic) = &self.diagnostic {
+            write!(f, " diagnostics={}", diagnostic)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl StdError for WorkerCommandError {}
+
+fn reqwest_error_diagnostic(err: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("top_level={}", err));
+    parts.push(format!("is_connect={}", err.is_connect()));
+    parts.push(format!("is_timeout={}", err.is_timeout()));
+    parts.push(format!("is_request={}", err.is_request()));
+    parts.push(format!("is_body={}", err.is_body()));
+    parts.push(format!(
+        "status={}",
+        err.status()
+            .map(|status| status.to_string())
+            .unwrap_or_else(|| "-".to_string())
+    ));
+
+    let inferred_stage = if err.is_connect() {
+        "connect"
+    } else if err.is_timeout() {
+        "timeout while connecting, writing request, or waiting for response"
+    } else if err.is_body() {
+        "reading response body"
+    } else if err.is_request() {
+        "writing request or waiting for response headers"
+    } else {
+        "unknown"
+    };
+    parts.push(format!("inferred_stage={}", inferred_stage));
+
+    let mut source = err.source();
+    let mut idx = 0usize;
+    while let Some(err) = source {
+        parts.push(format!("source[{}]={}", idx, err));
+        source = err.source();
+        idx += 1;
+    }
+
+    parts.join("; ")
+}
+
+async fn retry_worker_command_sleep(
+    worker: &WorkerSpec,
+    command_name: &str,
+    attempt: usize,
+    delay: &mut Duration,
+    url: &str,
+    err_text: &str,
+) {
+    let sleep_for = worker_command_with_jitter(*delay);
+    eprintln!(
+        "[retry] op=runner.worker_command worker={} command={} attempt={}/{} delay_ms={} url={} error={}",
+        worker.id,
+        command_name,
+        attempt,
+        WORKER_COMMAND_MAX_ATTEMPTS,
+        sleep_for.as_millis(),
+        url,
+        err_text
+    );
+    tokio::time::sleep(sleep_for).await;
+    *delay = worker_command_next_delay(*delay);
+}
+
+async fn send_command_with_context(
     http: &reqwest::Client,
     worker: &WorkerSpec,
     command: &Command,
+    context: &WorkerCommandContext,
 ) -> Result<CommandResponse> {
     let url = format!("{}/command", worker.url);
-    let command_name = command_kind(command);
+    let command_name = command.kind();
     let mut delay = WORKER_COMMAND_INITIAL_DELAY;
+    let request = CommandRequestEnvelope {
+        request_id: context.request_id.clone(),
+        command: command.clone(),
+        expected_epoch: context.expected_epoch,
+        phase: context.phase.clone(),
+    };
 
     for attempt in 1..=WORKER_COMMAND_MAX_ATTEMPTS {
-        let response = match http.post(&url).json(command).send().await {
+        let response = match http.post(&url).json(&request).send().await {
             Ok(response) => response,
-            Err(err) if is_connect_stage_reqwest_error(&err) => {
+            Err(err)
+                if is_transient_reqwest_error(&err) || is_connect_stage_reqwest_error(&err) =>
+            {
                 let err_text = err.to_string();
+                let diagnostic = reqwest_error_diagnostic(&err);
 
                 if attempt == WORKER_COMMAND_MAX_ATTEMPTS {
-                    return Err(anyhow!(
-                        "runner.worker_command failed: worker={} command={} url={} attempts={} classification=connect-stage-retryable last_error={}",
-                        worker.id,
-                        command_name,
-                        url,
-                        attempt,
-                        err_text
-                    ));
+                    return Err(WorkerCommandError {
+                        worker_id: worker.id.clone(),
+                        command: command_name,
+                        url: url.clone(),
+                        request_id: context.request_id.clone(),
+                        attempts: attempt,
+                        classification: WorkerCommandErrorClass::TransportRetryable,
+                        last_error: err_text,
+                        diagnostic: Some(diagnostic),
+                    }
+                    .into());
                 }
 
-                let sleep_for = worker_command_with_jitter(delay);
-                eprintln!(
-                    "[retry] op=runner.worker_command worker={} command={} attempt={}/{} delay_ms={} url={} error={}",
-                    worker.id,
+                retry_worker_command_sleep(
+                    worker,
                     command_name,
                     attempt,
-                    WORKER_COMMAND_MAX_ATTEMPTS,
-                    sleep_for.as_millis(),
-                    url,
-                    err_text
-                );
-                tokio::time::sleep(sleep_for).await;
-                delay = worker_command_next_delay(delay);
+                    &mut delay,
+                    &url,
+                    &format!("{} ({})", err_text, diagnostic),
+                )
+                .await;
                 continue;
             }
             Err(err) => {
-                return Err(anyhow!(
-                    "runner.worker_command failed: worker={} command={} url={} attempts={} classification=fatal/ambiguous last_error={}",
-                    worker.id,
-                    command_name,
+                return Err(WorkerCommandError {
+                    worker_id: worker.id.clone(),
+                    command: command_name,
                     url,
-                    attempt,
-                    err
-                ));
+                    request_id: context.request_id.clone(),
+                    attempts: attempt,
+                    classification: WorkerCommandErrorClass::FatalDecode,
+                    last_error: err.to_string(),
+                    diagnostic: Some(reqwest_error_diagnostic(&err)),
+                }
+                .into());
             }
         };
 
         let status = response.status();
         if !status.is_success() {
             let body = response.text().await.unwrap_or_default();
-            return Err(anyhow!(
-                "runner.worker_command failed: worker={} command={} url={} attempts={} classification=fatal-http-status status={} body={}",
-                worker.id,
-                command_name,
+            let last_error = format!("HTTP {}: {}", status, body);
+
+            if is_transient_status(status) && attempt < WORKER_COMMAND_MAX_ATTEMPTS {
+                retry_worker_command_sleep(
+                    worker,
+                    command_name,
+                    attempt,
+                    &mut delay,
+                    &url,
+                    &last_error,
+                )
+                .await;
+                continue;
+            }
+
+            return Err(WorkerCommandError {
+                worker_id: worker.id.clone(),
+                command: command_name,
                 url,
-                attempt,
-                status,
-                body
-            ));
+                request_id: context.request_id.clone(),
+                attempts: attempt,
+                classification: WorkerCommandErrorClass::FatalHttpStatus,
+                last_error,
+                diagnostic: None,
+            }
+            .into());
         }
 
-        let parsed: CommandResponse = response.json().await.with_context(|| {
-            format!(
-                "runner.worker_command failed: worker={} command={} url={} attempts={} classification=fatal-decode",
-                worker.id, command_name, url, attempt
-            )
-        })?;
+        match response.json::<CommandResponse>().await {
+            Ok(parsed) => return Ok(parsed),
+            Err(err) if is_transient_reqwest_error(&err) => {
+                let err_text = err.to_string();
+                let diagnostic = reqwest_error_diagnostic(&err);
 
-        return Ok(parsed);
+                if attempt == WORKER_COMMAND_MAX_ATTEMPTS {
+                    return Err(WorkerCommandError {
+                        worker_id: worker.id.clone(),
+                        command: command_name,
+                        url,
+                        request_id: context.request_id.clone(),
+                        attempts: attempt,
+                        classification: WorkerCommandErrorClass::TransportRetryable,
+                        last_error: err_text,
+                        diagnostic: Some(diagnostic),
+                    }
+                    .into());
+                }
+
+                retry_worker_command_sleep(
+                    worker,
+                    command_name,
+                    attempt,
+                    &mut delay,
+                    &url,
+                    &format!("{} ({})", err_text, diagnostic),
+                )
+                .await;
+                continue;
+            }
+            Err(err) => {
+                return Err(WorkerCommandError {
+                    worker_id: worker.id.clone(),
+                    command: command_name,
+                    url,
+                    request_id: context.request_id.clone(),
+                    attempts: attempt,
+                    classification: WorkerCommandErrorClass::FatalDecode,
+                    last_error: err.to_string(),
+                    diagnostic: Some(reqwest_error_diagnostic(&err)),
+                }
+                .into());
+            }
+        }
     }
 
     unreachable!("worker command retry loop always returns")
 }
 
-fn command_kind(command: &Command) -> &'static str {
-    match command {
-        Command::CreateGroup => "CreateGroup",
-        Command::GenerateKeyPackage => "GenerateKeyPackage",
-        Command::AddMembers { .. } => "AddMembers",
-        Command::JoinFromWelcome => "JoinFromWelcome",
-        Command::SendApplicationMessage { .. } => "SendApplicationMessage",
-        Command::ReceiveApplicationMessage { .. } => "ReceiveApplicationMessage",
-        Command::SelfUpdate => "SelfUpdate",
-        Command::RemoveMembers { .. } => "RemoveMembers",
-        Command::ReceiveCommit => "ReceiveCommit",
-        Command::ShowGroupState => "ShowGroupState",
-    }
+async fn send_command(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+) -> Result<CommandResponse> {
+    let context = WorkerCommandContext::new(worker, command);
+    send_command_with_context(http, worker, command, &context).await
 }
 
 fn worker_command_next_delay(delay: Duration) -> Duration {
@@ -679,7 +1028,18 @@ async fn send_cmd_expect_ok_fragment(
     command: &Command,
     ok_fragment: &str,
 ) -> Result<String> {
-    let response = send_command(http, worker, command).await?;
+    let context = WorkerCommandContext::new(worker, command);
+    send_cmd_expect_ok_fragment_with_context(http, worker, command, ok_fragment, &context).await
+}
+
+async fn send_cmd_expect_ok_fragment_with_context(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    command: &Command,
+    ok_fragment: &str,
+    context: &WorkerCommandContext,
+) -> Result<String> {
+    let response = send_command_with_context(http, worker, command, context).await?;
 
     match response.status.as_str() {
         "ok" if response.message.contains(ok_fragment) => Ok(response.message),
@@ -782,6 +1142,162 @@ async fn show_group_state(
     parse_group_state_message(&message)
 }
 
+fn expected_group_state(
+    reference: &GroupStateSnapshot,
+    epoch: u64,
+    mut members: Vec<String>,
+) -> ExpectedGroupState {
+    members.sort();
+    ExpectedGroupState {
+        group_id: reference.group_id.clone(),
+        epoch,
+        members,
+    }
+}
+
+fn expected_epoch(expected: &ExpectedReceiveCommitState) -> Option<u64> {
+    match expected {
+        ExpectedReceiveCommitState::Group(state) => Some(state.epoch),
+        ExpectedReceiveCommitState::Removed { expected_epoch } => Some(*expected_epoch),
+    }
+}
+
+async fn receive_commit_reconciled_by_state(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    expected: &ExpectedReceiveCommitState,
+    original_error: &str,
+) -> Result<bool> {
+    match show_group_state(http, worker).await {
+        Ok(snapshot) => match expected {
+            ExpectedReceiveCommitState::Group(expected_state) if expected_state.matches(&snapshot) => {
+                eprintln!(
+                    "receive_commit ambiguous transport error reconciled by epoch check: worker={} expected_epoch={} original_error={}",
+                    worker.id, expected_state.epoch, original_error
+                );
+                Ok(true)
+            }
+            ExpectedReceiveCommitState::Group(expected_state) if snapshot.epoch < expected_state.epoch => {
+                eprintln!(
+                    "[reconcile] receive_commit worker={} is behind after ambiguous transport error: current_epoch={} expected_epoch={}",
+                    worker.id, snapshot.epoch, expected_state.epoch
+                );
+                Ok(false)
+            }
+            ExpectedReceiveCommitState::Group(expected_state) => Err(anyhow!(
+                "receive_commit ambiguous transport error could not be reconciled for worker {}: expected group_id={} epoch={} members={:?}; got group_id={} epoch={} members={:?}; original_error={}",
+                worker.id,
+                expected_state.group_id,
+                expected_state.epoch,
+                expected_state.members,
+                snapshot.group_id,
+                snapshot.epoch,
+                snapshot.members,
+                original_error
+            )),
+            ExpectedReceiveCommitState::Removed { expected_epoch } => Err(anyhow!(
+                "receive_commit ambiguous transport error could not be reconciled for removed worker {}: expected removed after epoch {}, but ShowGroupState still returned group_id={} epoch={} members={:?}; original_error={}",
+                worker.id,
+                expected_epoch,
+                snapshot.group_id,
+                snapshot.epoch,
+                snapshot.members,
+                original_error
+            )),
+        },
+        Err(err) => {
+            let text = format!("{:#}", err);
+            if matches!(expected, ExpectedReceiveCommitState::Removed { .. })
+                && text.contains("Client is not in a group")
+            {
+                eprintln!(
+                    "receive_commit ambiguous transport error reconciled by removed-state check: worker={} original_error={}",
+                    worker.id, original_error
+                );
+                return Ok(true);
+            }
+
+            Err(anyhow!(
+                "receive_commit ambiguous transport error reconciliation could not query worker {} state: {}; original_error={}",
+                worker.id,
+                text,
+                original_error
+            ))
+        }
+    }
+}
+
+async fn receive_commit_expect(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    ok_fragment: &str,
+    expected: ExpectedReceiveCommitState,
+    phase: &str,
+) -> Result<()> {
+    let command = Command::ReceiveCommit;
+    let context = WorkerCommandContext::with_metadata(
+        worker,
+        &command,
+        expected_epoch(&expected),
+        Some(phase),
+    );
+
+    match send_cmd_expect_ok_fragment_with_context(http, worker, &command, ok_fragment, &context)
+        .await
+    {
+        Ok(_) => return Ok(()),
+        Err(err) => {
+            let is_ambiguous = err
+                .downcast_ref::<WorkerCommandError>()
+                .map(WorkerCommandError::is_ambiguous_transport)
+                .unwrap_or(false);
+
+            if !is_ambiguous {
+                return Err(err);
+            }
+
+            let original_error = format!("{:#}", err);
+            if receive_commit_reconciled_by_state(http, worker, &expected, &original_error).await? {
+                return Ok(());
+            }
+
+            eprintln!(
+                "[reconcile] receive_commit retrying same request_id={} worker={} phase={} after behind-state check",
+                context.request_id, worker.id, phase
+            );
+
+            match send_cmd_expect_ok_fragment_with_context(
+                http,
+                worker,
+                &command,
+                ok_fragment,
+                &context,
+            )
+            .await
+            {
+                Ok(_) => Ok(()),
+                Err(retry_err) => {
+                    let retry_error = format!("{:#}", retry_err);
+                    if receive_commit_reconciled_by_state(http, worker, &expected, &retry_error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+
+                    Err(anyhow!(
+                        "receive_commit failed after ambiguous transport reconciliation retry: worker={} request_id={} phase={} initial_error={} retry_error={}",
+                        worker.id,
+                        context.request_id,
+                        phase,
+                        original_error,
+                        retry_error
+                    ))
+                }
+            }
+        }
+    }
+}
+
 async fn ensure_converged(
     http: &reqwest::Client,
     active_workers: &[WorkerSpec],
@@ -839,6 +1355,10 @@ async fn ensure_converged(
         retry_count: 0,
         retry_sleep_ms: 0,
         failures: 0,
+        worker_latency_p50_ms: None,
+        worker_latency_p95_ms: None,
+        worker_latency_p99_ms: None,
+        worker_latency_max_ms: None,
     });
 
     Ok(reference.clone())
@@ -864,54 +1384,113 @@ async fn collect_worker_group_states(
     Ok(states)
 }
 
+fn latency_percentiles(
+    mut latencies: Vec<u128>,
+) -> (Option<u128>, Option<u128>, Option<u128>, Option<u128>) {
+    if latencies.is_empty() {
+        return (None, None, None, None);
+    }
+
+    latencies.sort_unstable();
+    let max = latencies.last().copied();
+
+    let percentile = |pct: usize| -> Option<u128> {
+        let len = latencies.len();
+        let idx = ((len.saturating_sub(1)) * pct).div_ceil(100);
+        latencies.get(idx).copied()
+    };
+
+    (percentile(50), percentile(95), percentile(99), max)
+}
+
 async fn fanout_workers<F, Fut>(
     phase: &str,
     group_size: usize,
     operation: &str,
     workers: &[WorkerSpec],
-    max_parallelism: usize,
+    fanout: &mut FanoutController,
     op: F,
 ) -> Result<()>
 where
-    F: Fn(WorkerSpec) -> Fut + Copy,
+    F: Fn(WorkerSpec) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
     let started = Instant::now();
-    let max_parallelism = max_parallelism.max(1);
+    let max_parallelism = fanout.parallelism();
+    let mut failures = Vec::new();
+    let mut latencies = Vec::with_capacity(workers.len());
 
     for chunk in workers.chunks(max_parallelism) {
-        let futures = chunk.iter().cloned().map(op);
-        if let Err(err) = try_join_all(futures).await {
-            emit_network_metrics(NetworkPhaseMetrics {
-                phase: phase.to_string(),
-                group_size,
-                operation: operation.to_string(),
-                request_count: workers.len(),
-                recipient_count: workers.len(),
-                max_parallelism,
-                wall_ms: started.elapsed().as_millis(),
-                retry_count: 0,
-                retry_sleep_ms: 0,
-                failures: 1,
-            });
-            return Err(err);
+        let futures = chunk.iter().cloned().map(|worker| {
+            let worker_for_result = worker.clone();
+            let future = op(worker);
+            async move {
+                let command_started = Instant::now();
+                let result = future.await;
+                (
+                    worker_for_result,
+                    command_started.elapsed().as_millis(),
+                    result,
+                )
+            }
+        });
+
+        for (worker, latency_ms, result) in join_all(futures).await {
+            latencies.push(latency_ms);
+
+            if let Err(err) = result {
+                failures.push((worker, err));
+            }
         }
     }
+
+    let (p50, p95, p99, max) = latency_percentiles(latencies);
+    let summary = FanoutSummary {
+        request_count: workers.len(),
+        failures: failures.len(),
+        wall_ms: started.elapsed().as_millis(),
+        latency_p50_ms: p50,
+        latency_p95_ms: p95,
+        latency_p99_ms: p99,
+        latency_max_ms: max,
+    };
 
     emit_network_metrics(NetworkPhaseMetrics {
         phase: phase.to_string(),
         group_size,
         operation: operation.to_string(),
-        request_count: workers.len(),
+        request_count: summary.request_count,
         recipient_count: workers.len(),
         max_parallelism,
-        wall_ms: started.elapsed().as_millis(),
+        wall_ms: summary.wall_ms,
         retry_count: 0,
         retry_sleep_ms: 0,
-        failures: 0,
+        failures: summary.failures,
+        worker_latency_p50_ms: summary.latency_p50_ms,
+        worker_latency_p95_ms: summary.latency_p95_ms,
+        worker_latency_p99_ms: summary.latency_p99_ms,
+        worker_latency_max_ms: summary.latency_max_ms,
     });
+    fanout.record(phase, operation, &summary);
 
-    Ok(())
+    if failures.is_empty() {
+        return Ok(());
+    }
+
+    let details = failures
+        .iter()
+        .map(|(worker, err)| format!("{}: {:#}", worker.id, err))
+        .collect::<Vec<_>>()
+        .join("; ");
+
+    Err(anyhow!(
+        "fanout phase={} operation={} failed_workers={} max_parallelism={} failures=[{}]",
+        phase,
+        operation,
+        failures.len(),
+        max_parallelism,
+        details
+    ))
 }
 
 fn emit_network_metrics(metrics: NetworkPhaseMetrics) {
@@ -1093,7 +1672,7 @@ async fn add_one_member(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
-    max_parallelism: usize,
+    fanout: &mut FanoutController,
     progress: &mut Progress,
 ) -> Result<()> {
     let timeout = Duration::from_secs(30);
@@ -1111,6 +1690,12 @@ async fn add_one_member(
         .pop_front()
         .ok_or_else(|| anyhow!("No idle worker available to add"))?;
 
+    let actor_before = show_group_state(http, &actor).await?;
+    let mut expected_members = actor_before.members.clone();
+    expected_members.push(joiner.id.clone());
+    let expected_after_commit =
+        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
+
     let fragment = format!("key package uploaded for {}", joiner.id);
     send_cmd_expect_ok_fragment(http, &joiner, &Command::GenerateKeyPackage, &fragment).await?;
 
@@ -1123,11 +1708,12 @@ async fn add_one_member(
         "added locally in one commit",
     )
     .await?;
-    send_cmd_expect_ok_fragment(
+    receive_commit_expect(
         http,
         &actor,
-        &Command::ReceiveCommit,
         "own commit accepted from DS",
+        ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+        "add_member.actor_receive_commit",
     )
     .await?;
 
@@ -1153,16 +1739,19 @@ async fn add_one_member(
         active.len(),
         "receive_commit",
         &recipients,
-        max_parallelism,
-        |worker| async move {
-            send_cmd_expect_ok_fragment(
-                http,
-                &worker,
-                &Command::ReceiveCommit,
-                "external commit received and processed",
-            )
-            .await
-            .map(|_| ())
+        fanout,
+        |worker| {
+            let expected = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
+            async move {
+                receive_commit_expect(
+                    http,
+                    &worker,
+                    "external commit received and processed",
+                    expected,
+                    "add_member.fanout_receive_commit",
+                )
+                .await
+            }
         },
     )
     .await?;
@@ -1176,7 +1765,7 @@ async fn remove_one_member(
     http: &reqwest::Client,
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
-    max_parallelism: usize,
+    fanout: &mut FanoutController,
     progress: &mut Progress,
 ) -> Result<()> {
     if active.len() <= 1 {
@@ -1196,6 +1785,15 @@ async fn remove_one_member(
     }
 
     let removed = active[removed_idx].clone();
+    let actor_before = show_group_state(http, &actor).await?;
+    let expected_members = actor_before
+        .members
+        .iter()
+        .filter(|member| *member != &removed.id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let expected_after_commit =
+        expected_group_state(&actor_before, actor_before.epoch + 1, expected_members);
 
     send_cmd_expect_ok_fragment(
         http,
@@ -1207,11 +1805,12 @@ async fn remove_one_member(
     )
     .await?;
 
-    send_cmd_expect_ok_fragment(
+    receive_commit_expect(
         http,
         &actor,
-        &Command::ReceiveCommit,
         "own commit accepted from DS",
+        ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+        "remove_member.actor_receive_commit",
     )
     .await?;
 
@@ -1225,16 +1824,26 @@ async fn remove_one_member(
         active.len(),
         "receive_commit",
         &recipients,
-        max_parallelism,
-        |worker| async move {
-            send_cmd_expect_ok_fragment(
-                http,
-                &worker,
-                &Command::ReceiveCommit,
-                "external commit received and processed",
-            )
-            .await
-            .map(|_| ())
+        fanout,
+        |worker| {
+            let expected = if worker.id == removed.id {
+                ExpectedReceiveCommitState::Removed {
+                    expected_epoch: expected_after_commit.epoch,
+                }
+            } else {
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone())
+            };
+
+            async move {
+                receive_commit_expect(
+                    http,
+                    &worker,
+                    "external commit received and processed",
+                    expected,
+                    "remove_member.fanout_receive_commit",
+                )
+                .await
+            }
         },
     )
     .await?;
@@ -1254,15 +1863,15 @@ async fn transition_to_size(
     active: &mut Vec<WorkerSpec>,
     idle: &mut VecDeque<WorkerSpec>,
     target_size: usize,
-    max_parallelism: usize,
+    fanout: &mut FanoutController,
     progress: &mut Progress,
 ) -> Result<()> {
     while active.len() < target_size {
-        add_one_member(http, active, idle, max_parallelism, progress).await?;
+        add_one_member(http, active, idle, fanout, progress).await?;
     }
 
     while active.len() > target_size {
-        remove_one_member(http, active, idle, max_parallelism, progress).await?;
+        remove_one_member(http, active, idle, fanout, progress).await?;
     }
 
     Ok(())
@@ -1274,7 +1883,7 @@ async fn run_update_phase(
     plateau_size: usize,
     update_rounds: usize,
     max_update_samples_per_plateau: usize,
-    max_parallelism: usize,
+    fanout: &mut FanoutController,
     progress: &mut Progress,
 ) -> Result<()> {
     let total_updates =
@@ -1291,6 +1900,12 @@ async fn run_update_phase(
     for seq_no in 0..total_updates {
         let actor_idx = sampled_member_index(active.len(), total_updates, seq_no);
         let actor = &active[actor_idx];
+        let actor_before = show_group_state(http, actor).await?;
+        let expected_after_commit = expected_group_state(
+            &actor_before,
+            actor_before.epoch + 1,
+            actor_before.members.clone(),
+        );
 
         send_cmd_expect_ok_fragment(
             http,
@@ -1300,11 +1915,12 @@ async fn run_update_phase(
         )
         .await?;
 
-        send_cmd_expect_ok_fragment(
+        receive_commit_expect(
             http,
             actor,
-            &Command::ReceiveCommit,
             "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "update.actor_receive_commit",
         )
         .await?;
 
@@ -1319,16 +1935,19 @@ async fn run_update_phase(
             plateau_size,
             "receive_commit",
             &recipients,
-            max_parallelism,
-            |worker| async move {
-                send_cmd_expect_ok_fragment(
-                    http,
-                    &worker,
-                    &Command::ReceiveCommit,
-                    "external commit received and processed",
-                )
-                .await
-                .map(|_| ())
+            fanout,
+            |worker| {
+                let expected = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
+                async move {
+                    receive_commit_expect(
+                        http,
+                        &worker,
+                        "external commit received and processed",
+                        expected,
+                        "update.fanout_receive_commit",
+                    )
+                    .await
+                }
             },
         )
         .await?;
@@ -1352,7 +1971,7 @@ async fn run_application_phase(
     app_rounds: usize,
     max_app_samples_per_payload: usize,
     payload_sizes: &[usize],
-    max_parallelism: usize,
+    fanout: &mut FanoutController,
     progress: &mut Progress,
 ) -> Result<()> {
     if active.len() < 2 {
@@ -1400,36 +2019,32 @@ async fn run_application_phase(
                 .enumerate()
                 .map(|(pos, recipient_idx)| (pos, active[*recipient_idx].clone()))
                 .collect();
-            let started = Instant::now();
-            let max_parallelism = max_parallelism.max(1);
+            let sampled_worker_id = recipients[sampled_pos].1.id.clone();
+            let recipient_workers: Vec<WorkerSpec> =
+                recipients.into_iter().map(|(_, worker)| worker).collect();
 
-            for chunk in recipients.chunks(max_parallelism) {
-                let receive_tasks = chunk.iter().cloned().map(|(pos, worker)| async move {
-                    let profile = pos == sampled_pos;
-                    send_cmd_expect_ok_fragment(
-                        http,
-                        &worker,
-                        &Command::ReceiveApplicationMessage { profile },
-                        "application message received:",
-                    )
-                    .await
-                    .map(|_| ())
-                });
-                try_join_all(receive_tasks).await?;
-            }
-
-            emit_network_metrics(NetworkPhaseMetrics {
-                phase: "application".to_string(),
-                group_size: plateau_size,
-                operation: "receive_application_message".to_string(),
-                request_count: recipients.len(),
-                recipient_count: recipients.len(),
-                max_parallelism,
-                wall_ms: started.elapsed().as_millis(),
-                retry_count: 0,
-                retry_sleep_ms: 0,
-                failures: 0,
-            });
+            fanout_workers(
+                "application",
+                plateau_size,
+                "receive_application_message",
+                &recipient_workers,
+                fanout,
+                |worker| {
+                    let sampled_worker_id = sampled_worker_id.clone();
+                    async move {
+                        let profile = worker.id == sampled_worker_id;
+                        send_cmd_expect_ok_fragment(
+                            http,
+                            &worker,
+                            &Command::ReceiveApplicationMessage { profile },
+                            "application message received:",
+                        )
+                        .await
+                        .map(|_| ())
+                    }
+                },
+            )
+            .await?;
 
             progress.tick(&format!(
                 "plateau {} app payload={} {}/{} actor={}",
@@ -1573,7 +2188,14 @@ fn validate_config(config: &StaircaseConfig, worker_count: usize) -> Result<usiz
 
 #[cfg(test)]
 mod tests {
-    use super::sampled_member_index;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use anyhow::anyhow;
+
+    use super::{fanout_workers, sampled_member_index, FanoutController, WorkerSpec};
 
     fn sampled_indices(member_count: usize, sample_count: usize) -> Vec<usize> {
         (0..sample_count)
@@ -1603,5 +2225,42 @@ mod tests {
         assert_eq!(indices.last(), Some(&99));
         assert!(indices.iter().all(|&idx| idx < 100));
         assert!(indices.windows(2).all(|pair| pair[0] < pair[1]));
+    }
+
+    #[tokio::test]
+    async fn fanout_attempts_all_workers_before_returning_failures() {
+        let workers = (1..=4)
+            .map(|idx| WorkerSpec {
+                id: format!("{idx:05}"),
+                url: format!("http://worker-{idx:05}:8080"),
+            })
+            .collect::<Vec<_>>();
+
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let mut fanout = FanoutController::new(4, false);
+        let attempts_for_op = attempts.clone();
+
+        let result = fanout_workers(
+            "test",
+            workers.len(),
+            "synthetic",
+            &workers,
+            &mut fanout,
+            move |worker| {
+                let attempts = attempts_for_op.clone();
+                async move {
+                    attempts.fetch_add(1, Ordering::SeqCst);
+                    if worker.id == "00002" {
+                        Err(anyhow!("synthetic transient failure"))
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert_eq!(attempts.load(Ordering::SeqCst), workers.len());
     }
 }

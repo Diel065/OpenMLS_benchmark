@@ -88,7 +88,15 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Maximum bounded parallelism for runner-to-worker fan-out. "
-            "0 lets the Rust runner choose a CPU-scaled default."
+            "0 lets the Rust runner choose its conservative Docker-network default."
+        ),
+    )
+    p.add_argument(
+        "--fanout-adaptive",
+        action="store_true",
+        help=(
+            "Enable adaptive runner fan-out throttling. Starts at 32 and reduces "
+            "parallelism on latency/error spikes."
         ),
     )
     p.add_argument(
@@ -193,6 +201,11 @@ def build_parser() -> argparse.ArgumentParser:
         "--keep-stack-up",
         action="store_true",
         help="Do not run docker compose down at the end",
+    )
+    p.add_argument(
+        "--keep-stack-up-on-failure",
+        action="store_true",
+        help="Do not run docker compose down when startup or runner execution fails",
     )
     p.add_argument(
         "--keep-generated-files",
@@ -444,6 +457,238 @@ def write_compose_logs(root: Path, compose_file: Path, dest: Path, append: bool 
         )
 
 
+def run_capture(
+        root: Path,
+        dest: Path,
+        cmd: list[str],
+        *,
+        env: dict[str, str] | None = None,
+) -> None:
+    with dest.open("w", encoding="utf-8") as f:
+        f.write("$ " + " ".join(cmd) + "\n\n")
+        subprocess.run(
+            cmd,
+            cwd=str(root),
+            env=env,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=True,
+        )
+
+
+def extract_failed_worker_ids(terminal_output_path: Path) -> list[str]:
+    if not terminal_output_path.exists():
+        return []
+
+    text = terminal_output_path.read_text(encoding="utf-8", errors="replace")
+    patterns = [
+        r"worker=([0-9]{5})",
+        r"Worker ([0-9]{5})",
+        r"worker-([0-9]{5})",
+    ]
+
+    ids: list[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            worker_id = match.group(1)
+            if worker_id not in seen:
+                seen.add(worker_id)
+                ids.append(worker_id)
+
+    return ids[:25]
+
+
+def compose_service_logs(
+        root: Path,
+        compose_file: Path,
+        dest: Path,
+        services: list[str],
+        env: dict[str, str] | None,
+) -> None:
+    with dest.open("w", encoding="utf-8") as f:
+        subprocess.run(
+            [
+                "docker",
+                "compose",
+                "-f",
+                str(compose_file),
+                "logs",
+                "--no-color",
+                *services,
+            ],
+            cwd=str(root),
+            env=env,
+            stdout=f,
+            stderr=subprocess.STDOUT,
+            check=False,
+            text=True,
+        )
+
+
+def compose_container_id(
+        root: Path,
+        compose_file: Path,
+        service: str,
+        env: dict[str, str] | None,
+) -> str | None:
+    result = subprocess.run(
+        ["docker", "compose", "-f", str(compose_file), "ps", "-q", service],
+        cwd=str(root),
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+
+    container_id = result.stdout.strip()
+    return container_id or None
+
+
+def project_network_names(root: Path, project_name: str) -> list[str]:
+    result = subprocess.run(
+        ["docker", "network", "ls", "--format", "{{.Name}}"],
+        cwd=str(root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        check=False,
+    )
+
+    prefixes = (f"{project_name}_", f"{project_name}-")
+    return [
+        line.strip()
+        for line in result.stdout.splitlines()
+        if line.strip().startswith(prefixes)
+    ]
+
+
+def write_netcheck_targets(run_dir: Path, worker_ids: list[str]) -> None:
+    if not worker_ids:
+        return
+
+    target_path = run_dir / "netcheck_targets.txt"
+    target_path.write_text("\n".join(worker_ids) + "\n", encoding="utf-8")
+
+
+def collect_failure_diagnostics(
+        *,
+        root: Path,
+        compose_file: Path,
+        run_dir: Path,
+        args: argparse.Namespace,
+        compose_env: dict[str, str] | None,
+        project_name: str,
+        terminal_output_path: Path,
+) -> None:
+    diag_dir = run_dir / "failure_diagnostics"
+    diag_dir.mkdir(parents=True, exist_ok=True)
+
+    failed_worker_ids = extract_failed_worker_ids(terminal_output_path)
+    write_netcheck_targets(run_dir, failed_worker_ids)
+
+    print(
+        f"[diagnostics] collecting failure evidence in {diag_dir} "
+        f"failed_workers={failed_worker_ids or '-'}",
+        flush=True,
+    )
+
+    run_capture(
+        root,
+        diag_dir / "docker-compose-ps.txt",
+        ["docker", "compose", "-f", str(compose_file), "ps"],
+        env=compose_env,
+    )
+
+    services = ["runner", "ds", "relay"]
+    if args.include_netcheck:
+        services.append("netcheck")
+    services.extend(f"worker-{worker_id}" for worker_id in failed_worker_ids)
+    compose_service_logs(
+        root,
+        compose_file,
+        diag_dir / "focused-compose-logs.txt",
+        services,
+        compose_env,
+    )
+
+    for worker_id in failed_worker_ids:
+        service = f"worker-{worker_id}"
+        container_id = compose_container_id(root, compose_file, service, compose_env)
+        if container_id:
+            run_capture(
+                root,
+                diag_dir / f"{service}-inspect.json",
+                ["docker", "inspect", container_id],
+                env=compose_env,
+            )
+
+    networks = project_network_names(root, project_name)
+    for network in networks:
+        run_capture(
+            root,
+            diag_dir / f"network-{network}-inspect.json",
+            ["docker", "network", "inspect", network],
+            env=compose_env,
+        )
+
+    if failed_worker_ids:
+        probe_lines = []
+        for worker_id in failed_worker_ids[:5]:
+            probe_lines.append(f'echo "## worker-{worker_id}"')
+            probe_lines.append(
+                f'curl -fsS --connect-timeout 2 --max-time 5 '
+                f'http://worker-{worker_id}:8080/health || true'
+            )
+            probe_lines.append("")
+        probe_script = "\n".join(probe_lines)
+
+        if args.include_netcheck:
+            run_capture(
+                root,
+                diag_dir / "runner-network-health-probes.txt",
+                [
+                    "docker",
+                    "compose",
+                    "-f",
+                    str(compose_file),
+                    "run",
+                    "--rm",
+                    "--no-deps",
+                    "netcheck",
+                    "sh",
+                    "-lc",
+                    probe_script,
+                ],
+                env=compose_env,
+            )
+
+        for network in networks:
+            run_capture(
+                root,
+                diag_dir / f"diagnostic-container-health-probe-{network}.txt",
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--network",
+                    network,
+                    "nicolaka/netshoot:latest",
+                    "sh",
+                    "-lc",
+                    probe_script,
+                ],
+                env=compose_env,
+            )
+
+    if args.include_netcheck:
+        netcheck_log = run_dir / "netcheck.log"
+        if netcheck_log.exists():
+            shutil.copy2(netcheck_log, diag_dir / "netcheck.log")
+
+
 def worker_service_names(worker_count: int) -> list[str]:
     return [f"worker-{i:05d}" for i in range(1, worker_count + 1)]
 
@@ -641,6 +886,7 @@ def main() -> int:
         raise SystemExit(f"Missing generator script: {generator}")
 
     compose_up = False
+    failure_seen = False
 
     compose_env = None
     if args.compose_parallel_limit is not None:
@@ -761,12 +1007,17 @@ def main() -> int:
                 compose_up = True
 
         except subprocess.CalledProcessError as e:
+            failure_seen = True
+            compose_up = True
             write_compose_logs(root, compose_tmp, compose_logs_path, append=False)
-            compose_down(
+            collect_failure_diagnostics(
                 root=root,
                 compose_file=compose_tmp,
+                run_dir=run_dir,
                 args=args,
-                env=compose_env,
+                compose_env=compose_env,
+                project_name=project_name,
+                terminal_output_path=terminal_output_path,
             )
 
             raise RuntimeError(
@@ -855,6 +1106,7 @@ def main() -> int:
                 str(args.worker_health_poll_ms),
                 "--max-fanout-parallelism",
                 str(args.max_fanout_parallelism),
+                *(["--fanout-adaptive"] if args.fanout_adaptive else []),
                 "--http-pool-max-idle-per-host",
                 str(args.http_pool_max_idle_per_host),
                 *(["--preflight-only"] if args.preflight_only else []),
@@ -900,6 +1152,7 @@ def main() -> int:
                 str(args.worker_health_poll_ms),
                 "--max-fanout-parallelism",
                 str(args.max_fanout_parallelism),
+                *(["--fanout-adaptive"] if args.fanout_adaptive else []),
                 "--http-pool-max-idle-per-host",
                 str(args.http_pool_max_idle_per_host),
                 *(["--preflight-only"] if args.preflight_only else []),
@@ -922,6 +1175,16 @@ def main() -> int:
         )
 
         if exit_code != 0:
+            failure_seen = True
+            collect_failure_diagnostics(
+                root=root,
+                compose_file=compose_tmp,
+                run_dir=run_dir,
+                args=args,
+                compose_env=compose_env,
+                project_name=project_name,
+                terminal_output_path=terminal_output_path,
+            )
             raise RuntimeError(f"Benchmark runner exited with code {exit_code}")
 
         if not args.preflight_only:
@@ -937,6 +1200,7 @@ def main() -> int:
         return 0
 
     except Exception as e:
+        failure_seen = True
         print(
             f"[error] benchmark orchestration failed before cleanup: "
             f"{type(e).__name__}: {e}",
@@ -952,13 +1216,16 @@ def main() -> int:
             except Exception:
                 pass
 
-        if not args.keep_stack_up:
+        keep_stack = args.keep_stack_up or (failure_seen and args.keep_stack_up_on_failure)
+        if not keep_stack:
             compose_down(
                 root=root,
                 compose_file=compose_tmp,
                 args=args,
                 env=compose_env,
             )
+        elif compose_up:
+            print("[compose] keeping stack up", flush=True)
 
         if not args.keep_generated_files:
             for path in (compose_tmp, workers_internal_tmp, workers_host_tmp):

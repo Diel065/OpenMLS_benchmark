@@ -1,4 +1,7 @@
-use std::net::SocketAddr;
+use std::{
+    net::SocketAddr,
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -8,8 +11,11 @@ use axum::{
 };
 
 use mls_playground::client::Client;
-use mls_playground::debug::debug_logs_enabled;
-use mls_playground::worker_api::{handle_command, Command, CommandResponse, PendingIntent};
+use mls_playground::debug::{debug_logs_enabled, worker_debug_logs_enabled};
+use mls_playground::worker_api::{
+    handle_command, Command, CommandResponse, CompletedCommandCache, IncomingCommandRequest,
+    PendingIntent,
+};
 use tokio::sync::{mpsc, oneshot};
 
 const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
@@ -19,10 +25,18 @@ struct WorkerState {
     queued_intent: Option<PendingIntent>,
     ds_url: String,
     relay_url: String,
+    response_cache: CompletedCommandCache,
+    debug_enabled: bool,
 }
 
 struct WorkerCommandEnvelope {
+    request_id: Option<String>,
     command: Command,
+    expected_epoch: Option<u64>,
+    phase: Option<String>,
+    enqueued_at: Instant,
+    enqueued_unix_ms: u128,
+    queue_depth_estimate: usize,
     response_tx: oneshot::Sender<CommandResponse>,
 }
 
@@ -74,8 +88,9 @@ async fn health() -> &'static str {
 
 async fn run_command(
     State(command_tx): State<CommandTx>,
-    Json(command): Json<Command>,
+    Json(request): Json<IncomingCommandRequest>,
 ) -> Json<CommandResponse> {
+    let (request_id, command, expected_epoch, phase) = request.into_parts();
     let (response_tx, response_rx) = oneshot::channel();
     let queue_depth_estimate = command_tx
         .max_capacity()
@@ -91,7 +106,13 @@ async fn run_command(
 
     if command_tx
         .send(WorkerCommandEnvelope {
+            request_id,
             command,
+            expected_epoch,
+            phase,
+            enqueued_at: Instant::now(),
+            enqueued_unix_ms: unix_ms_now(),
+            queue_depth_estimate,
             response_tx,
         })
         .await
@@ -113,6 +134,57 @@ async fn run_command(
 
 async fn command_actor(mut rx: mpsc::Receiver<WorkerCommandEnvelope>, mut state: WorkerState) {
     while let Some(envelope) = rx.recv().await {
+        let request_id = envelope.request_id.as_deref().unwrap_or("-");
+        let command_name = envelope.command.kind();
+        let is_mutating = envelope.command.is_mls_mutating();
+        let phase = envelope.phase.as_deref().unwrap_or("-");
+
+        if let Some(request_id) = envelope.request_id.as_deref() {
+            if let Some(response) = state.response_cache.get(request_id) {
+                if state.debug_enabled {
+                    eprintln!(
+                        "[WORKER {}] command request_id={} command={} phase={} cache_hit=true queue_depth={} enqueued_unix_ms={} finish_unix_ms={} enqueued_ms_ago={} result_status={}",
+                        state.client.name,
+                        request_id,
+                        command_name,
+                        phase,
+                        envelope.queue_depth_estimate,
+                        envelope.enqueued_unix_ms,
+                        unix_ms_now(),
+                        envelope.enqueued_at.elapsed().as_millis(),
+                        response.status
+                    );
+                }
+
+                let _ = envelope.response_tx.send(response);
+                continue;
+            }
+        }
+
+        let start = Instant::now();
+        let start_unix_ms = unix_ms_now();
+        let before_epoch = if is_mutating {
+            state.client.current_epoch_u64().ok()
+        } else {
+            None
+        };
+
+        if state.debug_enabled {
+            eprintln!(
+                "[WORKER {}] command request_id={} command={} phase={} expected_epoch={:?} cache_hit=false queue_depth={} enqueued_unix_ms={} start_unix_ms={} enqueue_wait_ms={} epoch_before={:?}",
+                state.client.name,
+                request_id,
+                command_name,
+                phase,
+                envelope.expected_epoch,
+                envelope.queue_depth_estimate,
+                envelope.enqueued_unix_ms,
+                start_unix_ms,
+                envelope.enqueued_at.elapsed().as_millis(),
+                before_epoch
+            );
+        }
+
         let result = handle_command(
             &mut state.client,
             &state.ds_url,
@@ -127,8 +199,42 @@ async fn command_actor(mut rx: mpsc::Receiver<WorkerCommandEnvelope>, mut state:
             Err(err) => CommandResponse::error(err.to_string()),
         };
 
+        let after_epoch = if is_mutating {
+            state.client.current_epoch_u64().ok()
+        } else {
+            None
+        };
+
+        if state.debug_enabled {
+            eprintln!(
+                "[WORKER {}] command request_id={} command={} phase={} enqueued_unix_ms={} start_unix_ms={} finish_unix_ms={} finish_ms={} result_status={} epoch_before={:?} epoch_after={:?}",
+                state.client.name,
+                request_id,
+                command_name,
+                phase,
+                envelope.enqueued_unix_ms,
+                start_unix_ms,
+                unix_ms_now(),
+                start.elapsed().as_millis(),
+                response.status,
+                before_epoch,
+                after_epoch
+            );
+        }
+
+        if let Some(request_id) = envelope.request_id {
+            state.response_cache.insert(request_id, response.clone());
+        }
+
         let _ = envelope.response_tx.send(response);
     }
+}
+
+fn unix_ms_now() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis())
+        .unwrap_or_default()
 }
 
 fn command_queue_capacity() -> usize {
@@ -139,11 +245,30 @@ fn command_queue_capacity() -> usize {
         .unwrap_or(DEFAULT_COMMAND_QUEUE_CAPACITY)
 }
 
+fn idempotency_cache_size() -> usize {
+    std::env::var("OPENMLS_WORKER_IDEMPOTENCY_CACHE_SIZE")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2048)
+}
+
+fn idempotency_cache_ttl() -> Duration {
+    let seconds = std::env::var("OPENMLS_WORKER_IDEMPOTENCY_CACHE_TTL_SECONDS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(3600);
+
+    Duration::from_secs(seconds)
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let (name, ds_url, relay_url, listen_addr) = parse_args()?;
 
     let queue_capacity = command_queue_capacity();
+    let cache_size = idempotency_cache_size();
+    let cache_ttl = idempotency_cache_ttl();
+    let debug_enabled = worker_debug_logs_enabled(&name);
     let (command_tx, command_rx) = mpsc::channel(queue_capacity);
 
     tokio::spawn(command_actor(
@@ -153,6 +278,8 @@ async fn main() -> Result<()> {
             queued_intent: None,
             ds_url: ds_url.clone(),
             relay_url: relay_url.clone(),
+            response_cache: CompletedCommandCache::new(cache_size, cache_ttl),
+            debug_enabled,
         },
     ));
 
@@ -161,10 +288,16 @@ async fn main() -> Result<()> {
         .route("/command", post(run_command))
         .with_state(command_tx);
 
-    if debug_logs_enabled() {
+    if debug_enabled || debug_logs_enabled() {
         eprintln!(
-            "[WORKER {}] starting on http://{} with DS={} RELAY={} queue_capacity={}",
-            name, listen_addr, ds_url, relay_url, queue_capacity
+            "[WORKER {}] starting on http://{} with DS={} RELAY={} queue_capacity={} idempotency_cache_size={} idempotency_cache_ttl_seconds={}",
+            name,
+            listen_addr,
+            ds_url,
+            relay_url,
+            queue_capacity,
+            cache_size,
+            cache_ttl.as_secs()
         );
     }
 
