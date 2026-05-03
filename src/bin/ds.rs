@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use mls_playground::debug::debug_logs_enabled;
 use mls_playground::delivery_service::{DeliveryService, GroupInfo};
 
-type SharedDs = Arc<Mutex<DeliveryService>>;
+type SharedDs = Arc<DeliveryService>;
 
 #[derive(Debug, Deserialize)]
 struct GroupStatePutRequest {
@@ -51,11 +51,11 @@ fn parse_args() -> Result<SocketAddr> {
     Ok(listen_addr.unwrap_or_else(|| "127.0.0.1:3000".parse().unwrap()))
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let addr = parse_args()?;
 
-    let state: SharedDs = Arc::new(Mutex::new(DeliveryService::new()));
+    let state: SharedDs = Arc::new(DeliveryService::new());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -102,8 +102,7 @@ async fn publish_key_package(
     Path(owner): Path<String>,
     body: Bytes,
 ) -> StatusCode {
-    let mut ds = state.lock().unwrap();
-    ds.publish_key_package(&owner, body.to_vec());
+    state.publish_key_package(&owner, body.to_vec());
     if debug_logs_enabled() {
         println!("[DS] Stored KeyPackage for {}", owner);
     }
@@ -111,8 +110,7 @@ async fn publish_key_package(
 }
 
 async fn fetch_key_package(State(state): State<SharedDs>, Path(owner): Path<String>) -> Response {
-    let mut ds = state.lock().unwrap();
-    match ds.fetch_key_package(&owner) {
+    match state.fetch_key_package(&owner) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -123,9 +121,7 @@ async fn put_group_state(
     Path((group_id, epoch)): Path<(String, u64)>,
     Json(body): Json<GroupStatePutRequest>,
 ) -> Response {
-    let mut ds = state.lock().unwrap();
-
-    match ds.put_group_state(&group_id, epoch, body.members) {
+    match state.put_group_state(&group_id, epoch, body.members) {
         Ok(()) => {
             if debug_logs_enabled() {
                 println!(
@@ -140,8 +136,7 @@ async fn put_group_state(
 }
 
 async fn get_group_state(State(state): State<SharedDs>, Path(group_id): Path<String>) -> Response {
-    let ds = state.lock().unwrap();
-    match ds.get_group_state(&group_id) {
+    match state.get_group_state(&group_id) {
         Some(GroupInfo {
             current_epoch,
             members,
@@ -160,17 +155,14 @@ async fn publish_group_commit(
     Path((group_id, sender, epoch)): Path<(String, String, u64)>,
     body: Bytes,
 ) -> Response {
-    let mut ds = state.lock().unwrap();
-
-    match ds.publish_group_commit(&group_id, &sender, epoch, body.to_vec()) {
+    match state.publish_group_commit(&group_id, &sender, epoch, body.to_vec()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::CONFLICT, message).into_response(),
     }
 }
 
 async fn fetch_commit(State(state): State<SharedDs>, Path(recipient): Path<String>) -> Response {
-    let mut ds = state.lock().unwrap();
-    match ds.fetch_commit(&recipient) {
+    match state.fetch_commit(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -181,8 +173,7 @@ async fn publish_welcome(
     Path(recipient): Path<String>,
     body: Bytes,
 ) -> StatusCode {
-    let mut ds = state.lock().unwrap();
-    ds.publish_welcome(&recipient, body.to_vec());
+    state.publish_welcome(&recipient, body.to_vec());
     if debug_logs_enabled() {
         println!("[DS] Stored Welcome for {}", recipient);
     }
@@ -190,8 +181,7 @@ async fn publish_welcome(
 }
 
 async fn fetch_welcome(State(state): State<SharedDs>, Path(recipient): Path<String>) -> Response {
-    let mut ds = state.lock().unwrap();
-    match ds.fetch_welcome(&recipient) {
+    match state.fetch_welcome(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }
@@ -202,8 +192,7 @@ async fn publish_ratchet_tree(
     Path(recipient): Path<String>,
     body: Bytes,
 ) -> StatusCode {
-    let mut ds = state.lock().unwrap();
-    ds.publish_ratchet_tree(&recipient, body.to_vec());
+    state.publish_ratchet_tree(&recipient, body.to_vec());
     if debug_logs_enabled() {
         println!("[DS] Stored ratchet tree for {}", recipient);
     }
@@ -214,8 +203,7 @@ async fn fetch_ratchet_tree(
     State(state): State<SharedDs>,
     Path(recipient): Path<String>,
 ) -> Response {
-    let mut ds = state.lock().unwrap();
-    match ds.fetch_ratchet_tree(&recipient) {
+    match state.fetch_ratchet_tree(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }

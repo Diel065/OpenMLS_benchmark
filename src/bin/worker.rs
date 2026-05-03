@@ -1,5 +1,4 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -11,6 +10,9 @@ use axum::{
 use mls_playground::client::Client;
 use mls_playground::debug::debug_logs_enabled;
 use mls_playground::worker_api::{handle_command, Command, CommandResponse, PendingIntent};
+use tokio::sync::{mpsc, oneshot};
+
+const DEFAULT_COMMAND_QUEUE_CAPACITY: usize = 128;
 
 struct WorkerState {
     client: Client,
@@ -19,7 +21,12 @@ struct WorkerState {
     relay_url: String,
 }
 
-type SharedWorkerState = Arc<Mutex<WorkerState>>;
+struct WorkerCommandEnvelope {
+    command: Command,
+    response_tx: oneshot::Sender<CommandResponse>,
+}
+
+type CommandTx = mpsc::Sender<WorkerCommandEnvelope>;
 
 fn parse_args() -> Result<(String, String, String, SocketAddr)> {
     let mut args = std::env::args().skip(1);
@@ -66,65 +73,98 @@ async fn health() -> &'static str {
 }
 
 async fn run_command(
-    State(state): State<SharedWorkerState>,
+    State(command_tx): State<CommandTx>,
     Json(command): Json<Command>,
 ) -> Json<CommandResponse> {
-    let state = state.clone();
+    let (response_tx, response_rx) = oneshot::channel();
+    let queue_depth_estimate = command_tx
+        .max_capacity()
+        .saturating_sub(command_tx.capacity());
 
-    let result = tokio::task::spawn_blocking(move || {
-        let mut guard = match state.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                return CommandResponse::error("worker state lock poisoned");
-            }
-        };
+    if debug_logs_enabled() {
+        eprintln!(
+            "[WORKER] enqueue command; queue_depth_estimate={} queue_capacity={}",
+            queue_depth_estimate,
+            command_tx.max_capacity()
+        );
+    }
 
-        let ds_url = guard.ds_url.clone();
-        let relay_url = guard.relay_url.clone();
+    if command_tx
+        .send(WorkerCommandEnvelope {
+            command,
+            response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return Json(CommandResponse::error(
+            "worker command actor is not running",
+        ));
+    }
 
-        let WorkerState {
-            client,
-            queued_intent,
-            ds_url: _,
-            relay_url: _,
-        } = &mut *guard;
-
-        match handle_command(client, &ds_url, &relay_url, queued_intent, command) {
-            Ok(message) => CommandResponse::ok(message),
-            Err(err) => CommandResponse::error(err.to_string()),
-        }
-    })
-    .await;
-
-    match result {
+    match response_rx.await {
         Ok(response) => Json(response),
         Err(err) => Json(CommandResponse::error(format!(
-            "worker task join error: {}",
+            "worker command actor dropped response: {}",
             err
         ))),
     }
 }
 
-#[tokio::main(flavor = "current_thread")]
+async fn command_actor(mut rx: mpsc::Receiver<WorkerCommandEnvelope>, mut state: WorkerState) {
+    while let Some(envelope) = rx.recv().await {
+        let result = handle_command(
+            &mut state.client,
+            &state.ds_url,
+            &state.relay_url,
+            &mut state.queued_intent,
+            envelope.command,
+        )
+        .await;
+
+        let response = match result {
+            Ok(message) => CommandResponse::ok(message),
+            Err(err) => CommandResponse::error(err.to_string()),
+        };
+
+        let _ = envelope.response_tx.send(response);
+    }
+}
+
+fn command_queue_capacity() -> usize {
+    std::env::var("OPENMLS_WORKER_COMMAND_QUEUE_CAPACITY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|capacity| *capacity > 0)
+        .unwrap_or(DEFAULT_COMMAND_QUEUE_CAPACITY)
+}
+
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let (name, ds_url, relay_url, listen_addr) = parse_args()?;
 
-    let state: SharedWorkerState = Arc::new(Mutex::new(WorkerState {
-        client: Client::new(&name)?,
-        queued_intent: None,
-        ds_url: ds_url.clone(),
-        relay_url: relay_url.clone(),
-    }));
+    let queue_capacity = command_queue_capacity();
+    let (command_tx, command_rx) = mpsc::channel(queue_capacity);
+
+    tokio::spawn(command_actor(
+        command_rx,
+        WorkerState {
+            client: Client::new(&name)?,
+            queued_intent: None,
+            ds_url: ds_url.clone(),
+            relay_url: relay_url.clone(),
+        },
+    ));
 
     let app = Router::new()
         .route("/health", get(health))
         .route("/command", post(run_command))
-        .with_state(state);
+        .with_state(command_tx);
 
     if debug_logs_enabled() {
         eprintln!(
-            "[WORKER {}] starting on http://{} with DS={} RELAY={}",
-            name, listen_addr, ds_url, relay_url
+            "[WORKER {}] starting on http://{} with DS={} RELAY={} queue_capacity={}",
+            name, listen_addr, ds_url, relay_url, queue_capacity
         );
     }
 

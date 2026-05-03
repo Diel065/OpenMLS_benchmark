@@ -12,6 +12,7 @@ import sys
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 
@@ -80,6 +81,27 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=250,
         help="Polling interval in milliseconds for in-network worker health checks.",
+    )
+    p.add_argument(
+        "--max-fanout-parallelism",
+        type=int,
+        default=0,
+        help=(
+            "Maximum bounded parallelism for runner-to-worker fan-out. "
+            "0 lets the Rust runner choose a CPU-scaled default."
+        ),
+    )
+    p.add_argument(
+        "--http-pool-max-idle-per-host",
+        type=int,
+        default=32,
+        help="Maximum idle pooled HTTP connections per host for the Rust runner.",
+    )
+    p.add_argument(
+        "--host-health-parallelism",
+        type=int,
+        default=64,
+        help="Maximum parallel host-side worker health probes when not using --runner-in-docker.",
     )
 
     p.add_argument(
@@ -253,6 +275,44 @@ def wait_for_health(url: str, timeout_seconds: int, poll_seconds: float) -> None
         time.sleep(poll_seconds)
 
     raise RuntimeError(f"Timed out waiting for health endpoint: {url}")
+
+
+def wait_for_workers_health_parallel(
+        worker_lines: list[str],
+        timeout_seconds: int,
+        poll_seconds: float,
+        max_parallelism: int,
+) -> None:
+    if not worker_lines:
+        return
+
+    parsed_workers: list[tuple[str, str]] = []
+    for line in worker_lines:
+        worker_id, worker_url = line.split("=", 1)
+        parsed_workers.append((worker_id, worker_url))
+
+    parallelism = max(1, min(max_parallelism, len(parsed_workers)))
+    print(
+        f"[health] waiting for {len(parsed_workers)} workers with host parallelism={parallelism}",
+        flush=True,
+    )
+
+    def probe(worker: tuple[str, str]) -> str:
+        worker_id, worker_url = worker
+        wait_for_health(f"{worker_url}/health", timeout_seconds, poll_seconds)
+        return worker_id
+
+    completed = 0
+    with ThreadPoolExecutor(max_workers=parallelism) as executor:
+        futures = [executor.submit(probe, worker) for worker in parsed_workers]
+        for future in as_completed(futures):
+            worker_id = future.result()
+            completed += 1
+            if completed <= 10 or completed == len(parsed_workers) or completed % 100 == 0:
+                print(
+                    f"[health] worker {worker_id} ok ({completed}/{len(parsed_workers)})",
+                    flush=True,
+                )
 
 
 def read_worker_lines(path: Path) -> list[str]:
@@ -552,6 +612,15 @@ def main() -> int:
     if args.worker_health_poll_ms < 1:
         raise SystemExit("--worker-health-poll-ms must be >= 1")
 
+    if args.max_fanout_parallelism < 0:
+        raise SystemExit("--max-fanout-parallelism must be >= 0")
+
+    if args.http_pool_max_idle_per_host < 1:
+        raise SystemExit("--http-pool-max-idle-per-host must be >= 1")
+
+    if args.host_health_parallelism < 1:
+        raise SystemExit("--host-health-parallelism must be >= 1")
+
     run_id = args.run_id or timestamped_run_id(args.workers)
     scenario = args.scenario
     output_dir_name = args.output_dir
@@ -742,14 +811,12 @@ def main() -> int:
         if args.runner_in_docker:
             print("[health] skipping host worker health checks; runner will check workers inside Docker network")
         else:
-            for line in read_worker_lines(workers_host_tmp):
-                worker_id, worker_url = line.split("=", 1)
-                wait_for_health(
-                    f"{worker_url}/health",
-                    args.health_timeout_seconds,
-                    args.health_poll_seconds,
-                )
-                print(f"[health] worker {worker_id} ok")
+            wait_for_workers_health_parallel(
+                read_worker_lines(workers_host_tmp),
+                args.health_timeout_seconds,
+                args.health_poll_seconds,
+                args.host_health_parallelism,
+            )
 
         if args.runner_in_docker:
             benchmark_cmd = [
@@ -786,6 +853,10 @@ def main() -> int:
                 str(args.worker_health_timeout_seconds),
                 "--worker-health-poll-ms",
                 str(args.worker_health_poll_ms),
+                "--max-fanout-parallelism",
+                str(args.max_fanout_parallelism),
+                "--http-pool-max-idle-per-host",
+                str(args.http_pool_max_idle_per_host),
                 *(["--preflight-only"] if args.preflight_only else []),
                 "--run-id",
                 run_id,
@@ -827,6 +898,10 @@ def main() -> int:
                 str(args.worker_health_timeout_seconds),
                 "--worker-health-poll-ms",
                 str(args.worker_health_poll_ms),
+                "--max-fanout-parallelism",
+                str(args.max_fanout_parallelism),
+                "--http-pool-max-idle-per-host",
+                str(args.http_pool_max_idle_per_host),
                 *(["--preflight-only"] if args.preflight_only else []),
                 "--run-id",
                 run_id,

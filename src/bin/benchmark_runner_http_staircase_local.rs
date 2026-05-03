@@ -62,6 +62,12 @@ struct Args {
 
     #[arg(long, default_value = "benchmark_output")]
     output_dir: String,
+
+    #[arg(long, default_value_t = 0)]
+    max_fanout_parallelism: usize,
+
+    #[arg(long, default_value_t = 32)]
+    http_pool_max_idle_per_host: usize,
 }
 
 fn main() -> Result<()> {
@@ -92,6 +98,8 @@ fn main() -> Result<()> {
         payload_sizes: args.payload_sizes,
         worker_health_timeout_seconds: 300,
         worker_health_poll_ms: 250,
+        max_fanout_parallelism: args.max_fanout_parallelism,
+        http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
         run_id: args.run_id,
         scenario: args.scenario,
         output_dir: args.output_dir,

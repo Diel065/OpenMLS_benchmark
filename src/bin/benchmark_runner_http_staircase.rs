@@ -70,6 +70,12 @@ struct Args {
 
     #[arg(long, default_value_t = 250)]
     worker_health_poll_ms: u64,
+
+    #[arg(long, default_value_t = 0)]
+    max_fanout_parallelism: usize,
+
+    #[arg(long, default_value_t = 32)]
+    http_pool_max_idle_per_host: usize,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -133,5 +139,7 @@ fn main() -> Result<()> {
         output_dir: args.output_dir,
         worker_health_timeout_seconds: args.worker_health_timeout_seconds,
         worker_health_poll_ms: args.worker_health_poll_ms,
+        max_fanout_parallelism: args.max_fanout_parallelism,
+        http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
     })
 }

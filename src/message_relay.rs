@@ -1,4 +1,5 @@
 use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex, RwLock};
 
 use crate::debug::debug_logs_enabled;
 
@@ -6,22 +7,22 @@ use crate::debug::debug_logs_enabled;
 struct RelayEnvelope {
     group_id: String,
     sender: String,
-    message_bytes: Vec<u8>,
+    message_bytes: Arc<Vec<u8>>,
 }
 
 pub struct MessageRelay {
-    application_inboxes: HashMap<String, VecDeque<RelayEnvelope>>,
+    application_inboxes: RwLock<HashMap<String, Arc<Mutex<VecDeque<RelayEnvelope>>>>>,
 }
 
 impl MessageRelay {
     pub fn new() -> Self {
         Self {
-            application_inboxes: HashMap::new(),
+            application_inboxes: RwLock::new(HashMap::new()),
         }
     }
 
     pub fn publish_group_application_message(
-        &mut self,
+        &self,
         group_id: &str,
         sender: &str,
         recipients: &[String],
@@ -32,19 +33,20 @@ impl MessageRelay {
         }
 
         let mut delivered = 0usize;
+        let shared_message = Arc::new(message_bytes);
 
         for recipient in recipients {
             if recipient == sender {
                 continue;
             }
 
-            self.application_inboxes
-                .entry(recipient.clone())
-                .or_default()
+            self.inbox_queue(recipient)
+                .lock()
+                .unwrap()
                 .push_back(RelayEnvelope {
                     group_id: group_id.to_string(),
                     sender: sender.to_string(),
-                    message_bytes: message_bytes.clone(),
+                    message_bytes: Arc::clone(&shared_message),
                 });
 
             delivered += 1;
@@ -60,11 +62,14 @@ impl MessageRelay {
         Ok(())
     }
 
-    pub fn fetch_application_message(&mut self, recipient: &str) -> Option<Vec<u8>> {
-        let envelope = self
+    pub fn fetch_application_message(&self, recipient: &str) -> Option<Vec<u8>> {
+        let queue = self
             .application_inboxes
-            .get_mut(recipient)
-            .and_then(|queue| queue.pop_front());
+            .read()
+            .unwrap()
+            .get(recipient)
+            .cloned()?;
+        let envelope = queue.lock().unwrap().pop_front();
 
         if let Some(envelope) = envelope {
             if debug_logs_enabled() {
@@ -73,9 +78,27 @@ impl MessageRelay {
                     envelope.group_id, envelope.sender, recipient
                 );
             }
-            Some(envelope.message_bytes)
+            Some(envelope.message_bytes.as_ref().clone())
         } else {
             None
         }
+    }
+
+    fn inbox_queue(&self, recipient: &str) -> Arc<Mutex<VecDeque<RelayEnvelope>>> {
+        if let Some(queue) = self
+            .application_inboxes
+            .read()
+            .unwrap()
+            .get(recipient)
+            .cloned()
+        {
+            return queue;
+        }
+
+        let mut inboxes = self.application_inboxes.write().unwrap();
+        inboxes
+            .entry(recipient.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(VecDeque::new())))
+            .clone()
     }
 }

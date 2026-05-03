@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -46,6 +47,57 @@ where
                     cause
                 );
                 thread::sleep(sleep_for);
+                delay = next_delay(delay);
+            }
+            RetryDecision::Transient(cause) => {
+                return Err(anyhow!(
+                    "{} failed: client={} url={} attempts={} elapsed_ms={} cause={}",
+                    op,
+                    client_id.unwrap_or("-"),
+                    url,
+                    attempt,
+                    started.elapsed().as_millis(),
+                    cause
+                ));
+            }
+        }
+    }
+
+    unreachable!("retry loop always returns")
+}
+
+pub async fn retry_transient_http_async<T, F, Fut>(
+    op: &str,
+    client_id: Option<&str>,
+    url: &str,
+    mut attempt_fn: F,
+) -> Result<T>
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = RetryDecision<T>>,
+{
+    let started = Instant::now();
+    let mut delay = INITIAL_DELAY;
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match attempt_fn().await {
+            RetryDecision::Success(value) => return Ok(value),
+            RetryDecision::Fatal(err) => {
+                return Err(retry_error(op, client_id, url, attempt, started, err));
+            }
+            RetryDecision::Transient(cause) if attempt < MAX_ATTEMPTS => {
+                let sleep_for = with_jitter(delay);
+                eprintln!(
+                    "[retry] op={} client={} attempt={}/{} delay_ms={} url={} error={}",
+                    op,
+                    client_id.unwrap_or("-"),
+                    attempt,
+                    MAX_ATTEMPTS,
+                    sleep_for.as_millis(),
+                    url,
+                    cause
+                );
+                tokio::time::sleep(sleep_for).await;
                 delay = next_delay(delay);
             }
             RetryDecision::Transient(cause) => {

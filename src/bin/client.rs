@@ -48,7 +48,8 @@ fn print_response_error(message: &str) {
     print_response(&response);
 }
 
-fn main() -> Result<()> {
+#[tokio::main(flavor = "multi_thread")]
+async fn main() -> Result<()> {
     let (name, ds_url, relay_url) = parse_args()?;
 
     let mut client = Client::new(&name)?;
@@ -87,7 +88,9 @@ fn main() -> Result<()> {
             &relay_url,
             &mut queued_intent,
             command,
-        ) {
+        )
+        .await
+        {
             Ok(message) => print_response_ok(&message),
             Err(err) => print_response_error(&err.to_string()),
         }

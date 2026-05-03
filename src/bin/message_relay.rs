@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use anyhow::{anyhow, Result};
 use axum::{
@@ -13,7 +13,7 @@ use axum::{
 
 use mls_playground::message_relay::MessageRelay;
 
-type SharedRelay = Arc<Mutex<MessageRelay>>;
+type SharedRelay = Arc<MessageRelay>;
 
 fn parse_args() -> Result<SocketAddr> {
     let mut args = std::env::args().skip(1);
@@ -37,11 +37,11 @@ fn parse_args() -> Result<SocketAddr> {
     Ok(listen_addr.unwrap_or_else(|| "127.0.0.1:4000".parse().unwrap()))
 }
 
-#[tokio::main(flavor = "current_thread")]
+#[tokio::main(flavor = "multi_thread")]
 async fn main() -> Result<()> {
     let addr = parse_args()?;
 
-    let state: SharedRelay = Arc::new(Mutex::new(MessageRelay::new()));
+    let state: SharedRelay = Arc::new(MessageRelay::new());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -94,9 +94,7 @@ async fn publish_group_application_message(
         Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
     };
 
-    let mut relay = state.lock().unwrap();
-
-    match relay.publish_group_application_message(&group_id, &sender, &recipients, body.to_vec()) {
+    match state.publish_group_application_message(&group_id, &sender, &recipients, body.to_vec()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
     }
@@ -106,9 +104,7 @@ async fn fetch_application_message(
     State(state): State<SharedRelay>,
     Path(recipient): Path<String>,
 ) -> Response {
-    let mut relay = state.lock().unwrap();
-
-    match relay.fetch_application_message(&recipient) {
+    match state.fetch_application_message(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
     }
