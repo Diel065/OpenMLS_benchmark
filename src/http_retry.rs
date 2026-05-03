@@ -77,6 +77,27 @@ pub fn is_transient_reqwest_error(err: &reqwest::Error) -> bool {
         || message.contains("broken pipe")
 }
 
+pub fn is_connect_stage_reqwest_error(err: &reqwest::Error) -> bool {
+    if err.is_connect() {
+        return true;
+    }
+
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("host is unreachable")
+        || message.contains("no route to host")
+        || message.contains("network is unreachable")
+        || message.contains("connection refused")
+        || message.contains("tcp connect error")
+        || message.contains("connect timed out")
+        || message.contains("connection timed out")
+        || message.contains("dns error")
+        || message.contains("failed to lookup address information")
+        || message.contains("failed to resolve")
+        || message.contains("temporary failure in name resolution")
+        || message.contains("name or service not known")
+        || message.contains("nodename nor servname provided")
+}
+
 pub fn is_transient_status(status: StatusCode) -> bool {
     matches!(
         status,

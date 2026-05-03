@@ -12,9 +12,14 @@ use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
 use crate::http_retry::{
-    is_transient_reqwest_error, is_transient_status, retry_transient_http, RetryDecision,
+    is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
+    retry_transient_http, RetryDecision,
 };
 use crate::worker_api::{Command, CommandResponse};
+
+const WORKER_COMMAND_MAX_ATTEMPTS: usize = 10;
+const WORKER_COMMAND_INITIAL_DELAY: Duration = Duration::from_millis(100);
+const WORKER_COMMAND_MAX_DELAY: Duration = Duration::from_secs(3);
 
 #[derive(Debug, Clone)]
 pub struct StaircaseConfig {
@@ -174,7 +179,9 @@ pub fn run_staircase_benchmark(config: StaircaseConfig) -> Result<()> {
     fs::create_dir_all(&run_dir)?;
 
     let http = reqwest::blocking::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(60))
+        .pool_max_idle_per_host(0)
         .build()
         .context("Failed to build HTTP client")?;
 
@@ -445,29 +452,106 @@ fn send_command(
     command: &Command,
 ) -> Result<CommandResponse> {
     let url = format!("{}/command", worker.url);
+    let command_name = command_kind(command);
+    let mut delay = WORKER_COMMAND_INITIAL_DELAY;
 
-    let response = http
-        .post(&url)
-        .json(command)
-        .send()
-        .with_context(|| format!("Failed to POST command to worker {}", worker.id))?;
+    for attempt in 1..=WORKER_COMMAND_MAX_ATTEMPTS {
+        let response = match http.post(&url).json(command).send() {
+            Ok(response) => response,
+            Err(err) if is_connect_stage_reqwest_error(&err) => {
+                let err_text = err.to_string();
 
-    let status = response.status();
-    if !status.is_success() {
-        let body = response.text().unwrap_or_default();
-        return Err(anyhow!(
-            "Worker {} returned HTTP {}: {}",
-            worker.id,
-            status,
-            body
-        ));
+                if attempt == WORKER_COMMAND_MAX_ATTEMPTS {
+                    return Err(anyhow!(
+                        "runner.worker_command failed: worker={} command={} url={} attempts={} classification=connect-stage-retryable last_error={}",
+                        worker.id,
+                        command_name,
+                        url,
+                        attempt,
+                        err_text
+                    ));
+                }
+
+                let sleep_for = worker_command_with_jitter(delay);
+                eprintln!(
+                    "[retry] op=runner.worker_command worker={} command={} attempt={}/{} delay_ms={} url={} error={}",
+                    worker.id,
+                    command_name,
+                    attempt,
+                    WORKER_COMMAND_MAX_ATTEMPTS,
+                    sleep_for.as_millis(),
+                    url,
+                    err_text
+                );
+                thread::sleep(sleep_for);
+                delay = worker_command_next_delay(delay);
+                continue;
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "runner.worker_command failed: worker={} command={} url={} attempts={} classification=fatal/ambiguous last_error={}",
+                    worker.id,
+                    command_name,
+                    url,
+                    attempt,
+                    err
+                ));
+            }
+        };
+
+        let status = response.status();
+        if !status.is_success() {
+            let body = response.text().unwrap_or_default();
+            return Err(anyhow!(
+                "runner.worker_command failed: worker={} command={} url={} attempts={} classification=fatal-http-status status={} body={}",
+                worker.id,
+                command_name,
+                url,
+                attempt,
+                status,
+                body
+            ));
+        }
+
+        let parsed: CommandResponse = response.json().with_context(|| {
+            format!(
+                "runner.worker_command failed: worker={} command={} url={} attempts={} classification=fatal-decode",
+                worker.id, command_name, url, attempt
+            )
+        })?;
+
+        return Ok(parsed);
     }
 
-    let parsed: CommandResponse = response
-        .json()
-        .with_context(|| format!("Failed to decode JSON response from worker {}", worker.id))?;
+    unreachable!("worker command retry loop always returns")
+}
 
-    Ok(parsed)
+fn command_kind(command: &Command) -> &'static str {
+    match command {
+        Command::CreateGroup => "CreateGroup",
+        Command::GenerateKeyPackage => "GenerateKeyPackage",
+        Command::AddMembers { .. } => "AddMembers",
+        Command::JoinFromWelcome => "JoinFromWelcome",
+        Command::SendApplicationMessage { .. } => "SendApplicationMessage",
+        Command::ReceiveApplicationMessage { .. } => "ReceiveApplicationMessage",
+        Command::SelfUpdate => "SelfUpdate",
+        Command::RemoveMembers { .. } => "RemoveMembers",
+        Command::ReceiveCommit => "ReceiveCommit",
+        Command::ShowGroupState => "ShowGroupState",
+    }
+}
+
+fn worker_command_next_delay(delay: Duration) -> Duration {
+    let doubled_ms = delay.as_millis().saturating_mul(2);
+    let max_ms = WORKER_COMMAND_MAX_DELAY.as_millis();
+    Duration::from_millis(doubled_ms.min(max_ms) as u64)
+}
+
+fn worker_command_with_jitter(delay: Duration) -> Duration {
+    let base_ms = delay.as_millis() as u64;
+    let jitter_cap_ms = (base_ms / 10).clamp(1, 100);
+    let jitter_ms = thread_rng().gen_range(0..=jitter_cap_ms);
+    Duration::from_millis(base_ms + jitter_ms)
 }
 
 fn send_cmd_expect_ok_fragment(
