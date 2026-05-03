@@ -1,8 +1,13 @@
+use std::time::Duration;
+
 use anyhow::{anyhow, Result};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, CommitReceiveOutcome, EpochChangeOutput};
+use crate::http_retry::{
+    is_transient_reqwest_error, is_transient_status, retry_transient_http, RetryDecision,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
@@ -63,62 +68,137 @@ pub enum DsPostResult {
     Conflict(String),
 }
 
+fn control_http_client() -> Result<reqwest::blocking::Client> {
+    reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .map_err(|err| anyhow!("Failed to build HTTP client: {}", err))
+}
+
+fn transient_or_fatal<T>(err: reqwest::Error) -> RetryDecision<T> {
+    if is_transient_reqwest_error(&err) {
+        RetryDecision::Transient(err.to_string())
+    } else {
+        RetryDecision::Fatal(anyhow!(err))
+    }
+}
+
+fn read_response_text(response: reqwest::blocking::Response) -> String {
+    response.text().unwrap_or_default()
+}
+
 pub fn ds_post_bytes_allow_conflict(
     ds_url: &str,
     path: &str,
     bytes: Vec<u8>,
+    op: &str,
+    client_id: &str,
 ) -> Result<DsPostResult> {
     let url = format!("{ds_url}{path}");
+    let http = control_http_client()?;
 
-    let client = reqwest::blocking::Client::new();
-    let response = client.post(url).body(bytes).send()?;
+    retry_transient_http(op, Some(client_id), &url, || {
+        let response = match http.post(&url).body(bytes.clone()).send() {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
 
-    if response.status().is_success() {
-        return Ok(DsPostResult::Ok);
-    }
+        let status = response.status();
 
-    if response.status() == StatusCode::CONFLICT {
-        let body = response.text().unwrap_or_default();
-        return Ok(DsPostResult::Conflict(body));
-    }
+        if status.is_success() {
+            return RetryDecision::Success(DsPostResult::Ok);
+        }
 
-    let status = response.status();
-    let body = response.text().unwrap_or_default();
-    Err(anyhow!("DS POST failed with status {}: {}", status, body))
+        let body = read_response_text(response);
+
+        if status == StatusCode::CONFLICT {
+            return RetryDecision::Success(DsPostResult::Conflict(body));
+        }
+
+        if is_transient_status(status) {
+            return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+        }
+
+        RetryDecision::Fatal(anyhow!("DS POST failed with status {}: {}", status, body))
+    })
 }
 
-pub fn ds_post_bytes(ds_url: &str, path: &str, bytes: Vec<u8>) -> Result<()> {
-    match ds_post_bytes_allow_conflict(ds_url, path, bytes)? {
+pub fn ds_post_bytes(
+    ds_url: &str,
+    path: &str,
+    bytes: Vec<u8>,
+    op: &str,
+    client_id: &str,
+) -> Result<()> {
+    match ds_post_bytes_allow_conflict(ds_url, path, bytes, op, client_id)? {
         DsPostResult::Ok => Ok(()),
         DsPostResult::Conflict(message) => Err(anyhow!("Unexpected DS conflict: {}", message)),
     }
 }
 
-pub fn ds_put_json<T: Serialize>(ds_url: &str, path: &str, body: &T) -> Result<()> {
+pub fn ds_put_json<T: Serialize>(
+    ds_url: &str,
+    path: &str,
+    body: &T,
+    op: &str,
+    client_id: &str,
+) -> Result<()> {
     let url = format!("{ds_url}{path}");
+    let http = control_http_client()?;
 
-    let client = reqwest::blocking::Client::new();
-    let response = client.put(url).json(body).send()?;
+    retry_transient_http(op, Some(client_id), &url, || {
+        let response = match http.put(&url).json(body).send() {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
 
-    if !response.status().is_success() {
         let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(anyhow!("DS PUT failed with status {}: {}", status, body));
-    }
 
-    Ok(())
+        if status.is_success() {
+            return RetryDecision::Success(());
+        }
+
+        let response_body = read_response_text(response);
+
+        if is_transient_status(status) {
+            return RetryDecision::Transient(format!("HTTP {}: {}", status, response_body));
+        }
+
+        RetryDecision::Fatal(anyhow!(
+            "DS PUT failed with status {}: {}",
+            status,
+            response_body
+        ))
+    })
 }
 
-pub fn ds_get_bytes(ds_url: &str, path: &str) -> Result<Vec<u8>> {
+pub fn ds_get_bytes(ds_url: &str, path: &str, op: &str, client_id: &str) -> Result<Vec<u8>> {
     let url = format!("{ds_url}{path}");
+    let http = control_http_client()?;
 
-    let response = reqwest::blocking::get(url)?;
+    retry_transient_http(op, Some(client_id), &url, || {
+        let response = match http.get(&url).send() {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
 
-    if !response.status().is_success() {
-        return Err(anyhow!("DS GET failed with status {}", response.status()));
-    }
+        let status = response.status();
 
-    Ok(response.bytes()?.to_vec())
+        if !status.is_success() {
+            let body = read_response_text(response);
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            return RetryDecision::Fatal(anyhow!("DS GET failed with status {}: {}", status, body));
+        }
+
+        match response.bytes() {
+            Ok(bytes) => RetryDecision::Success(bytes.to_vec()),
+            Err(err) => transient_or_fatal(err),
+        }
+    })
 }
 
 pub fn relay_post_application_message(
@@ -136,25 +216,42 @@ pub fn relay_post_application_message(
     );
 
     let recipients_header = recipients.join(",");
+    let http = control_http_client()?;
 
-    let client = reqwest::blocking::Client::new();
-    let response = client
-        .post(url)
-        .header("x-recipients", recipients_header)
-        .body(bytes)
-        .send()?;
+    retry_transient_http(
+        "relay.publish_application_message",
+        Some(sender),
+        &url,
+        || {
+            let response = match http
+                .post(&url)
+                .header("x-recipients", recipients_header.clone())
+                .body(bytes.clone())
+                .send()
+            {
+                Ok(response) => response,
+                Err(err) => return transient_or_fatal(err),
+            };
 
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().unwrap_or_default();
-        return Err(anyhow!(
-            "Relay POST failed with status {}: {}",
-            status,
-            body
-        ));
-    }
+            let status = response.status();
 
-    Ok(())
+            if status.is_success() {
+                return RetryDecision::Success(());
+            }
+
+            let body = read_response_text(response);
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            RetryDecision::Fatal(anyhow!(
+                "Relay POST failed with status {}: {}",
+                status,
+                body
+            ))
+        },
+    )
 }
 
 pub fn relay_get_application_message(relay_url: &str, recipient: &str) -> Result<Vec<u8>> {
@@ -163,17 +260,40 @@ pub fn relay_get_application_message(relay_url: &str, recipient: &str) -> Result
         relay_url.trim_end_matches('/'),
         recipient
     );
+    let http = control_http_client()?;
 
-    let response = reqwest::blocking::get(url)?;
+    retry_transient_http(
+        "relay.fetch_application_message",
+        Some(recipient),
+        &url,
+        || {
+            let response = match http.get(&url).send() {
+                Ok(response) => response,
+                Err(err) => return transient_or_fatal(err),
+            };
 
-    if !response.status().is_success() {
-        return Err(anyhow!(
-            "Relay GET failed with status {}",
-            response.status()
-        ));
-    }
+            let status = response.status();
 
-    Ok(response.bytes()?.to_vec())
+            if !status.is_success() {
+                let body = read_response_text(response);
+
+                if is_transient_status(status) {
+                    return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+                }
+
+                return RetryDecision::Fatal(anyhow!(
+                    "Relay GET failed with status {}: {}",
+                    status,
+                    body
+                ));
+            }
+
+            match response.bytes() {
+                Ok(bytes) => RetryDecision::Success(bytes.to_vec()),
+                Err(err) => transient_or_fatal(err),
+            }
+        },
+    )
 }
 
 pub fn update_ds_group_state(client: &Client, ds_url: &str) -> Result<()> {
@@ -184,7 +304,7 @@ pub fn update_ds_group_state(client: &Client, ds_url: &str) -> Result<()> {
     let path = format!("/group/{group_id}/state/{epoch}");
     let body = GroupStatePutRequest { members };
 
-    ds_put_json(ds_url, &path, &body)
+    ds_put_json(ds_url, &path, &body, "update_group_state", &client.name)
 }
 
 pub fn publish_epoch_change(
@@ -196,7 +316,13 @@ pub fn publish_epoch_change(
     let epoch = client.current_epoch_u64()?;
     let path = format!("/group/{group_id}/commit/{}/{epoch}", client.name);
 
-    ds_post_bytes_allow_conflict(ds_url, &path, result.commit_bytes)
+    ds_post_bytes_allow_conflict(
+        ds_url,
+        &path,
+        result.commit_bytes,
+        "submit_commit",
+        &client.name,
+    )
 }
 
 pub fn try_start_intent(
@@ -282,7 +408,13 @@ pub fn handle_command(
         Command::GenerateKeyPackage => {
             let key_package_bytes = client.generate_key_package()?;
             let path = format!("/keypackage/{}", client.name);
-            ds_post_bytes(ds_url, &path, key_package_bytes)?;
+            ds_post_bytes(
+                ds_url,
+                &path,
+                key_package_bytes,
+                "store_keypackage",
+                &client.name,
+            )?;
             Ok(format!("key package uploaded for {}", client.name))
         }
 
@@ -291,7 +423,8 @@ pub fn handle_command(
 
             for member in &members {
                 let kp_path = format!("/keypackage/{member}");
-                let key_package_bytes = ds_get_bytes(ds_url, &kp_path)?;
+                let key_package_bytes =
+                    ds_get_bytes(ds_url, &kp_path, "fetch_keypackage", &client.name)?;
                 key_package_bytes_list.push(key_package_bytes);
             }
 
@@ -319,8 +452,9 @@ pub fn handle_command(
             let welcome_path = format!("/welcome/{}", client.name);
             let tree_path = format!("/ratchet-tree/{}", client.name);
 
-            let welcome_bytes = ds_get_bytes(ds_url, &welcome_path)?;
-            let ratchet_tree_bytes = ds_get_bytes(ds_url, &tree_path)?;
+            let welcome_bytes = ds_get_bytes(ds_url, &welcome_path, "fetch_welcome", &client.name)?;
+            let ratchet_tree_bytes =
+                ds_get_bytes(ds_url, &tree_path, "fetch_ratchet_tree", &client.name)?;
 
             client.join_from_welcome(&welcome_bytes, &ratchet_tree_bytes)?;
 
@@ -390,7 +524,7 @@ pub fn handle_command(
 
         Command::ReceiveCommit => {
             let path = format!("/commit/{}", client.name);
-            let commit_bytes = ds_get_bytes(ds_url, &path)?;
+            let commit_bytes = ds_get_bytes(ds_url, &path, "fetch_commit", &client.name)?;
 
             match client.receive_commit(&commit_bytes)? {
                 CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
@@ -429,10 +563,22 @@ pub fn handle_command(
                         if let (Some(welcome), Some(tree)) = (welcome_bytes, ratchet_tree_bytes) {
                             for recipient in &welcome_recipients {
                                 let welcome_path = format!("/welcome/{recipient}");
-                                ds_post_bytes(ds_url, &welcome_path, welcome.clone())?;
+                                ds_post_bytes(
+                                    ds_url,
+                                    &welcome_path,
+                                    welcome.clone(),
+                                    "store_welcome",
+                                    &client.name,
+                                )?;
 
                                 let tree_path = format!("/ratchet-tree/{recipient}");
-                                ds_post_bytes(ds_url, &tree_path, tree.clone())?;
+                                ds_post_bytes(
+                                    ds_url,
+                                    &tree_path,
+                                    tree.clone(),
+                                    "store_ratchet_tree",
+                                    &client.name,
+                                )?;
                             }
                         }
 

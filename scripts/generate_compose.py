@@ -267,6 +267,15 @@ done
     for bridge in bridges:
         lines.append(f"      - {bridge}")
 
+
+def append_bounded_logging(lines: list[str], indent: str = "    ") -> None:
+    lines.append(f"{indent}logging:")
+    lines.append(f'{indent}  driver: "local"')
+    lines.append(f"{indent}  options:")
+    lines.append(f'{indent}    max-size: "10m"')
+    lines.append(f'{indent}    max-file: "3"')
+
+
 def generate_compose_text(args: argparse.Namespace) -> str:
     lines: list[str] = []
     bridges = bridge_names(args)
@@ -283,6 +292,7 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append("    - relay")
     lines.append("  volumes:")
     lines.append(f"    - ./{args.output_dir}:/results")
+    append_bounded_logging(lines, indent="  ")
     lines.append("")
     lines.append("services:")
 
@@ -294,6 +304,7 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append("    networks:")
     for bridge in bridges:
         lines.append(f"      - {bridge}")
+    append_bounded_logging(lines)
     lines.append("")
 
     lines.append("  relay:")
@@ -304,6 +315,7 @@ def generate_compose_text(args: argparse.Namespace) -> str:
     lines.append("    networks:")
     for bridge in bridges:
         lines.append(f"      - {bridge}")
+    append_bounded_logging(lines)
 
     for i in range(1, args.workers + 1):
         wid = worker_id(i)
@@ -348,9 +360,11 @@ def generate_compose_text(args: argparse.Namespace) -> str:
         lines.append("    networks:")
         for bridge in bridges:
             lines.append(f"      - {bridge}")
+        append_bounded_logging(lines)
 
     if args.include_netcheck:
         append_netcheck_service(lines, args=args, bridges=bridges)
+        append_bounded_logging(lines)
 
     lines.append("")
     lines.append("networks:")

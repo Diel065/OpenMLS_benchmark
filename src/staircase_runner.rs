@@ -11,6 +11,9 @@ use anyhow::{anyhow, Context, Result};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
+use crate::http_retry::{
+    is_transient_reqwest_error, is_transient_status, retry_transient_http, RetryDecision,
+};
 use crate::worker_api::{Command, CommandResponse};
 
 #[derive(Debug, Clone)]
@@ -74,7 +77,6 @@ struct ProfileEvent {
     scenario: Option<String>,
     node_name: Option<String>,
     pod_name: Option<String>,
-
 }
 
 struct Progress {
@@ -332,16 +334,35 @@ fn wait_for_health(
     timeout: Duration,
 ) -> Result<()> {
     let url = format!("{}/health", base_url.trim_end_matches('/'));
-    let start = Instant::now();
+    let per_request_timeout = timeout.min(Duration::from_secs(5));
 
-    while start.elapsed() < timeout {
-        match http.get(&url).send() {
-            Ok(resp) if resp.status().is_success() => return Ok(()),
-            _ => thread::sleep(Duration::from_millis(250)),
+    retry_transient_http("ds.health", None, &url, || {
+        let response = match http.get(&url).timeout(per_request_timeout).send() {
+            Ok(response) => response,
+            Err(err) if is_transient_reqwest_error(&err) => {
+                return RetryDecision::Transient(err.to_string())
+            }
+            Err(err) => return RetryDecision::Fatal(anyhow!(err)),
+        };
+
+        let status = response.status();
+
+        if status.is_success() {
+            return RetryDecision::Success(());
         }
-    }
 
-    Err(anyhow!("Timeout waiting for health endpoint at {}", url))
+        let body = response.text().unwrap_or_default();
+
+        if is_transient_status(status) {
+            return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+        }
+
+        RetryDecision::Fatal(anyhow!(
+            "Health check failed with status {}: {}",
+            status,
+            body
+        ))
+    })
 }
 
 fn wait_for_all_workers_healthy(

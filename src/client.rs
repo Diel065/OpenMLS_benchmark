@@ -5,7 +5,7 @@ use openmls_basic_credential::SignatureKeyPair;
 use openmls_rust_crypto::OpenMlsRustCrypto;
 use tls_codec::{Deserialize, Serialize};
 
-use crate::debug::print_bytes;
+use crate::debug::{debug_logs_enabled, print_bytes};
 
 pub struct Client {
     pub name: String,
@@ -125,7 +125,9 @@ impl Client {
         if let Some(group) = &self.group {
             let group_id_bytes = group.group_id().as_slice();
             print_bytes(&format!("{} group_id", self.name), group_id_bytes);
-            println!("[DBG] {} epoch={:?}", self.name, group.epoch());
+            if debug_logs_enabled() {
+                println!("[DBG] {} epoch={:?}", self.name, group.epoch());
+            }
         }
 
         Ok(())

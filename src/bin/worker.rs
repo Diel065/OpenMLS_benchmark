@@ -9,6 +9,7 @@ use axum::{
 };
 
 use mls_playground::client::Client;
+use mls_playground::debug::debug_logs_enabled;
 use mls_playground::worker_api::{handle_command, Command, CommandResponse, PendingIntent};
 
 struct WorkerState {
@@ -120,10 +121,12 @@ async fn main() -> Result<()> {
         .route("/command", post(run_command))
         .with_state(state);
 
-    eprintln!(
-        "[WORKER {}] starting on http://{} with DS={} RELAY={}",
-        name, listen_addr, ds_url, relay_url
-    );
+    if debug_logs_enabled() {
+        eprintln!(
+            "[WORKER {}] starting on http://{} with DS={} RELAY={}",
+            name, listen_addr, ds_url, relay_url
+        );
+    }
 
     let listener = tokio::net::TcpListener::bind(listen_addr)
         .await

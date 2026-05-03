@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
+use crate::debug::debug_logs_enabled;
+
 #[derive(Clone, Debug)]
 struct RelayEnvelope {
     group_id: String,
@@ -48,10 +50,12 @@ impl MessageRelay {
             delivered += 1;
         }
 
-        println!(
-            "[RELAY] Broadcast application message for group={} from sender={} to {} recipients",
-            group_id, sender, delivered
-        );
+        if debug_logs_enabled() {
+            println!(
+                "[RELAY] Broadcast application message for group={} from sender={} to {} recipients",
+                group_id, sender, delivered
+            );
+        }
 
         Ok(())
     }
@@ -63,10 +67,12 @@ impl MessageRelay {
             .and_then(|queue| queue.pop_front());
 
         if let Some(envelope) = envelope {
-            println!(
-                "[RELAY] Delivered application message for group={} from sender={} to recipient={}",
-                envelope.group_id, envelope.sender, recipient
-            );
+            if debug_logs_enabled() {
+                println!(
+                    "[RELAY] Delivered application message for group={} from sender={} to recipient={}",
+                    envelope.group_id, envelope.sender, recipient
+                );
+            }
             Some(envelope.message_bytes)
         } else {
             None

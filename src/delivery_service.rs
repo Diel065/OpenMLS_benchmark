@@ -1,5 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 
+use crate::debug::debug_logs_enabled;
+
 #[derive(Clone, Debug)]
 pub struct GroupInfo {
     pub current_epoch: u64,
@@ -108,10 +110,12 @@ impl DeliveryService {
 
         state.current_epoch += 1;
 
-        println!(
-            "[DS] Accepted commit for group={} epoch={} from sender={}",
-            group_id, epoch, sender
-        );
+        if debug_logs_enabled() {
+            println!(
+                "[DS] Accepted commit for group={} epoch={} from sender={}",
+                group_id, epoch, sender
+            );
+        }
 
         Ok(())
     }

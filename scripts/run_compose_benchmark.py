@@ -153,6 +153,14 @@ def build_parser() -> argparse.ArgumentParser:
             "This allows workers to avoid publishing host ports."
         ),
     )
+    p.add_argument(
+        "--include-netcheck",
+        action="store_true",
+        help=(
+            "Include the continuous diagnostic netcheck service in the generated "
+            "Compose stack. Default: disabled."
+        ),
+    )
 
     p.add_argument(
         "--build-images",
@@ -628,7 +636,8 @@ def main() -> int:
         else:
             generator_cmd.append("--publish-workers")
 
-        generator_cmd.append("--include-netcheck")
+        if args.include_netcheck:
+            generator_cmd.append("--include-netcheck")
 
         run_cmd(generator_cmd, cwd=root)
 
@@ -721,13 +730,14 @@ def main() -> int:
         )
         print("[health] relay ok", flush=True)
 
-        print("[netcheck] starting continuous network monitor", flush=True)
-        run_cmd(
-            ["docker", "compose", "-f", str(compose_tmp), "up", "-d", "netcheck"],
-            cwd=root,
-            env=compose_env,
-        )
-        print(f"[netcheck] writing continuous log to {run_dir / 'netcheck.log'}", flush=True)
+        if args.include_netcheck:
+            print("[netcheck] starting continuous network monitor", flush=True)
+            run_cmd(
+                ["docker", "compose", "-f", str(compose_tmp), "up", "-d", "netcheck"],
+                cwd=root,
+                env=compose_env,
+            )
+            print(f"[netcheck] writing continuous log to {run_dir / 'netcheck.log'}", flush=True)
 
         if args.runner_in_docker:
             print("[health] skipping host worker health checks; runner will check workers inside Docker network")

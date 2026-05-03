@@ -12,6 +12,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 
+use mls_playground::debug::debug_logs_enabled;
 use mls_playground::delivery_service::{DeliveryService, GroupInfo};
 
 type SharedDs = Arc<Mutex<DeliveryService>>;
@@ -103,7 +104,9 @@ async fn publish_key_package(
 ) -> StatusCode {
     let mut ds = state.lock().unwrap();
     ds.publish_key_package(&owner, body.to_vec());
-    println!("[DS] Stored KeyPackage for {}", owner);
+    if debug_logs_enabled() {
+        println!("[DS] Stored KeyPackage for {}", owner);
+    }
     StatusCode::OK
 }
 
@@ -124,10 +127,12 @@ async fn put_group_state(
 
     match ds.put_group_state(&group_id, epoch, body.members) {
         Ok(()) => {
-            println!(
-                "[DS] Updated group state for group={} epoch={}",
-                group_id, epoch
-            );
+            if debug_logs_enabled() {
+                println!(
+                    "[DS] Updated group state for group={} epoch={}",
+                    group_id, epoch
+                );
+            }
             StatusCode::OK.into_response()
         }
         Err(message) => (StatusCode::CONFLICT, message).into_response(),
@@ -178,7 +183,9 @@ async fn publish_welcome(
 ) -> StatusCode {
     let mut ds = state.lock().unwrap();
     ds.publish_welcome(&recipient, body.to_vec());
-    println!("[DS] Stored Welcome for {}", recipient);
+    if debug_logs_enabled() {
+        println!("[DS] Stored Welcome for {}", recipient);
+    }
     StatusCode::OK
 }
 
@@ -197,7 +204,9 @@ async fn publish_ratchet_tree(
 ) -> StatusCode {
     let mut ds = state.lock().unwrap();
     ds.publish_ratchet_tree(&recipient, body.to_vec());
-    println!("[DS] Stored ratchet tree for {}", recipient);
+    if debug_logs_enabled() {
+        println!("[DS] Stored ratchet tree for {}", recipient);
+    }
     StatusCode::OK
 }
 
