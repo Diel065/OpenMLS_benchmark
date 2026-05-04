@@ -100,10 +100,68 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     p.add_argument(
+        "--no-fanout-adaptive",
+        action="store_true",
+        help="Disable adaptive fan-out even for large Docker worker counts.",
+    )
+    p.add_argument(
+        "--min-fanout-parallelism",
+        type=int,
+        default=0,
+        help="Minimum adaptive runner fan-out parallelism. 0 uses the Rust runner default.",
+    )
+    p.add_argument(
+        "--fanout-error-rate-threshold",
+        type=float,
+        default=0.0,
+        help="Adaptive fan-out error-rate threshold. 0 uses the Rust runner default.",
+    )
+    p.add_argument(
+        "--fanout-p95-threshold-ms",
+        type=int,
+        default=0,
+        help="Adaptive fan-out p95 latency threshold in milliseconds. 0 uses the Rust runner default.",
+    )
+    p.add_argument(
         "--http-pool-max-idle-per-host",
         type=int,
-        default=32,
+        default=0,
         help="Maximum idle pooled HTTP connections per host for the Rust runner.",
+    )
+    p.add_argument(
+        "--process-pending-fanout",
+        action="store_true",
+        help="Use worker ProcessPending for receive-commit fan-out.",
+    )
+    p.add_argument(
+        "--ds-delivery-mode",
+        choices=("per-recipient", "group-log"),
+        default="per-recipient",
+        help="DS commit delivery mode exposed as OPENMLS_DS_DELIVERY_MODE.",
+    )
+    p.add_argument(
+        "--worker-http-pool-max-idle-per-host",
+        type=int,
+        default=4,
+        help="OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST for worker->DS/relay clients.",
+    )
+    p.add_argument(
+        "--worker-http-connect-timeout-ms",
+        type=int,
+        default=2000,
+        help="OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS for worker->DS/relay clients.",
+    )
+    p.add_argument(
+        "--worker-http-request-timeout-ms",
+        type=int,
+        default=15000,
+        help="OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS for worker->DS/relay clients.",
+    )
+    p.add_argument(
+        "--worker-outbound-http-permits",
+        type=int,
+        default=2,
+        help="OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS per worker process.",
     )
     p.add_argument(
         "--host-health-parallelism",
@@ -477,27 +535,58 @@ def run_capture(
         )
 
 
+def write_url_capture(dest: Path, url: str, timeout_seconds: float = 3.0) -> None:
+    with dest.open("w", encoding="utf-8") as f:
+        f.write(f"$ GET {url}\n\n")
+        try:
+            with urllib.request.urlopen(url, timeout=timeout_seconds) as response:
+                f.write(response.read().decode("utf-8", errors="replace"))
+        except (urllib.error.URLError, TimeoutError, OSError) as err:
+            f.write(f"ERROR: {err}\n")
+
+
 def extract_failed_worker_ids(terminal_output_path: Path) -> list[str]:
     if not terminal_output_path.exists():
         return []
 
     text = terminal_output_path.read_text(encoding="utf-8", errors="replace")
-    patterns = [
+    ids: list[str] = []
+    seen: set[str] = set()
+
+    def add(worker_id: str) -> None:
+        if worker_id not in seen:
+            seen.add(worker_id)
+            ids.append(worker_id)
+
+    tail = text[-250_000:]
+    priority_patterns = [
+        r"failures=\[([^\]]+)\]",
+        r"runner\.worker_command failed: worker=([0-9]{5})",
+        r"Worker ([0-9]{5}) error:",
+        r"client=([0-9]{5}) url=http://(?:ds|relay)",
+    ]
+
+    for pattern in priority_patterns:
+        for match in re.finditer(pattern, tail, flags=re.DOTALL):
+            if match.lastindex == 1 and "[" not in match.group(1) and ":" not in match.group(1):
+                add(match.group(1))
+                continue
+
+            for worker_id in re.findall(r"\b([0-9]{5})\b", match.group(0)):
+                add(worker_id)
+
+    fallback_patterns = [
         r"worker=([0-9]{5})",
         r"Worker ([0-9]{5})",
         r"worker-([0-9]{5})",
+        r"client=([0-9]{5})",
     ]
-
-    ids: list[str] = []
-    seen: set[str] = set()
-    for pattern in patterns:
+    for pattern in fallback_patterns:
         for match in re.finditer(pattern, text):
             worker_id = match.group(1)
-            if worker_id not in seen:
-                seen.add(worker_id)
-                ids.append(worker_id)
+            add(worker_id)
 
-    return ids[:25]
+    return ids[:50]
 
 
 def compose_service_logs(
@@ -601,6 +690,11 @@ def collect_failure_diagnostics(
         ["docker", "compose", "-f", str(compose_file), "ps"],
         env=compose_env,
     )
+    write_url_capture(diag_dir / "ds-metrics.json", f"http://127.0.0.1:{args.ds_port}/metrics")
+    write_url_capture(
+        diag_dir / "relay-metrics.json",
+        f"http://127.0.0.1:{args.relay_port}/metrics",
+    )
 
     services = ["runner", "ds", "relay"]
     if args.include_netcheck:
@@ -624,6 +718,12 @@ def collect_failure_diagnostics(
                 ["docker", "inspect", container_id],
                 env=compose_env,
             )
+            run_capture(
+                root,
+                diag_dir / f"{service}-docker-logs.txt",
+                ["docker", "logs", "--timestamps", container_id],
+                env=compose_env,
+            )
 
     networks = project_network_names(root, project_name)
     for network in networks:
@@ -636,7 +736,7 @@ def collect_failure_diagnostics(
 
     if failed_worker_ids:
         probe_lines = []
-        for worker_id in failed_worker_ids[:5]:
+        for worker_id in failed_worker_ids[:10]:
             probe_lines.append(f'echo "## worker-{worker_id}"')
             probe_lines.append(
                 f'curl -fsS --connect-timeout 2 --max-time 5 '
@@ -664,6 +764,32 @@ def collect_failure_diagnostics(
                 ],
                 env=compose_env,
             )
+
+        for worker_id in failed_worker_ids[:10]:
+            worker_index = int(worker_id)
+            bridge_index = ((worker_index - 1) * args.bridge_count) // args.workers
+            bridge_suffix = f"bench-net-{bridge_index:03d}"
+            matching_networks = [name for name in networks if name.endswith(bridge_suffix)]
+            for network in matching_networks[:1]:
+                run_capture(
+                    root,
+                    diag_dir / f"failed-worker-{worker_id}-own-network-health.txt",
+                    [
+                        "docker",
+                        "run",
+                        "--rm",
+                        "--network",
+                        network,
+                        "nicolaka/netshoot:latest",
+                        "sh",
+                        "-lc",
+                        (
+                            f"curl -fsS --connect-timeout 2 --max-time 5 "
+                            f"http://worker-{worker_id}:8080/health || true"
+                        ),
+                    ],
+                    env=compose_env,
+                )
 
         for network in networks:
             run_capture(
@@ -696,6 +822,19 @@ def worker_service_names(worker_count: int) -> list[str]:
 def chunks(items: list[str], size: int):
     for start in range(0, len(items), size):
         yield items[start:start + size]
+
+
+def build_compose_env(args: argparse.Namespace) -> dict[str, str]:
+    env = dict(os.environ)
+    if args.compose_parallel_limit is not None:
+        env["COMPOSE_PARALLEL_LIMIT"] = str(args.compose_parallel_limit)
+
+    env["OPENMLS_DS_DELIVERY_MODE"] = args.ds_delivery_mode
+    env["OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST"] = str(args.worker_http_pool_max_idle_per_host)
+    env["OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS"] = str(args.worker_http_connect_timeout_ms)
+    env["OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS"] = str(args.worker_http_request_timeout_ms)
+    env["OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS"] = str(args.worker_outbound_http_permits)
+    return env
 
 
 def compose_down(
@@ -860,8 +999,32 @@ def main() -> int:
     if args.max_fanout_parallelism < 0:
         raise SystemExit("--max-fanout-parallelism must be >= 0")
 
-    if args.http_pool_max_idle_per_host < 1:
-        raise SystemExit("--http-pool-max-idle-per-host must be >= 1")
+    if args.min_fanout_parallelism < 0:
+        raise SystemExit("--min-fanout-parallelism must be >= 0")
+
+    if args.fanout_adaptive and args.no_fanout_adaptive:
+        raise SystemExit("--fanout-adaptive and --no-fanout-adaptive cannot both be set")
+
+    if args.fanout_error_rate_threshold < 0:
+        raise SystemExit("--fanout-error-rate-threshold must be >= 0")
+
+    if args.fanout_p95_threshold_ms < 0:
+        raise SystemExit("--fanout-p95-threshold-ms must be >= 0")
+
+    if args.http_pool_max_idle_per_host < 0:
+        raise SystemExit("--http-pool-max-idle-per-host must be >= 0")
+
+    if args.worker_http_pool_max_idle_per_host < 1:
+        raise SystemExit("--worker-http-pool-max-idle-per-host must be >= 1")
+
+    if args.worker_http_connect_timeout_ms < 1:
+        raise SystemExit("--worker-http-connect-timeout-ms must be >= 1")
+
+    if args.worker_http_request_timeout_ms < 1:
+        raise SystemExit("--worker-http-request-timeout-ms must be >= 1")
+
+    if args.worker_outbound_http_permits < 1:
+        raise SystemExit("--worker-outbound-http-permits must be >= 1")
 
     if args.host_health_parallelism < 1:
         raise SystemExit("--host-health-parallelism must be >= 1")
@@ -888,10 +1051,7 @@ def main() -> int:
     compose_up = False
     failure_seen = False
 
-    compose_env = None
-    if args.compose_parallel_limit is not None:
-        compose_env = dict(os.environ)
-        compose_env["COMPOSE_PARALLEL_LIMIT"] = str(args.compose_parallel_limit)
+    compose_env = build_compose_env(args)
 
     try:
         if args.force_cleanup_mls_ports:
@@ -959,11 +1119,6 @@ def main() -> int:
         copy_if_exists(compose_tmp, run_dir / "docker-compose.generated.yml")
         copy_if_exists(workers_internal_tmp, run_dir / "workers.txt")
         copy_if_exists(workers_host_tmp, run_dir / "workers.host.txt")
-
-        compose_env = None
-        if args.compose_parallel_limit is not None:
-            compose_env = os.environ.copy()
-            compose_env["COMPOSE_PARALLEL_LIMIT"] = str(args.compose_parallel_limit)
 
         try:
             if args.startup_batch_size > 0:
@@ -1106,9 +1261,17 @@ def main() -> int:
                 str(args.worker_health_poll_ms),
                 "--max-fanout-parallelism",
                 str(args.max_fanout_parallelism),
+                "--min-fanout-parallelism",
+                str(args.min_fanout_parallelism),
                 *(["--fanout-adaptive"] if args.fanout_adaptive else []),
+                *(["--no-fanout-adaptive"] if args.no_fanout_adaptive else []),
+                "--fanout-error-rate-threshold",
+                str(args.fanout_error_rate_threshold),
+                "--fanout-p95-threshold-ms",
+                str(args.fanout_p95_threshold_ms),
                 "--http-pool-max-idle-per-host",
                 str(args.http_pool_max_idle_per_host),
+                *(["--process-pending-fanout"] if args.process_pending_fanout else []),
                 *(["--preflight-only"] if args.preflight_only else []),
                 "--run-id",
                 run_id,
@@ -1152,9 +1315,17 @@ def main() -> int:
                 str(args.worker_health_poll_ms),
                 "--max-fanout-parallelism",
                 str(args.max_fanout_parallelism),
+                "--min-fanout-parallelism",
+                str(args.min_fanout_parallelism),
                 *(["--fanout-adaptive"] if args.fanout_adaptive else []),
+                *(["--no-fanout-adaptive"] if args.no_fanout_adaptive else []),
+                "--fanout-error-rate-threshold",
+                str(args.fanout_error_rate_threshold),
+                "--fanout-p95-threshold-ms",
+                str(args.fanout_p95_threshold_ms),
                 "--http-pool-max-idle-per-host",
                 str(args.http_pool_max_idle_per_host),
+                *(["--process-pending-fanout"] if args.process_pending_fanout else []),
                 *(["--preflight-only"] if args.preflight_only else []),
                 "--run-id",
                 run_id,

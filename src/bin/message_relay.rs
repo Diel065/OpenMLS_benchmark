@@ -45,6 +45,7 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route(
             "/group/{group_id}/application-message/{sender}",
             post(publish_group_application_message),
@@ -72,42 +73,65 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn metrics(
+    State(state): State<SharedRelay>,
+) -> axum::Json<mls_playground::service_metrics::ServiceMetricsSnapshot> {
+    axum::Json(state.metrics().snapshot())
+}
+
 async fn publish_group_application_message(
     State(state): State<SharedRelay>,
     Path((group_id, sender)): Path<(String, String)>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let metrics = state.metrics().start("publish_group_application_message");
     let recipients_header = match headers.get("x-recipients") {
         Some(value) => value,
         None => {
-            return (
+            let response = (
                 StatusCode::BAD_REQUEST,
                 "Missing required x-recipients header",
             )
-                .into_response()
+                .into_response();
+            metrics.finish(false);
+            return response;
         }
     };
 
     let recipients = match parse_recipients_header(recipients_header) {
         Ok(recipients) => recipients,
-        Err(message) => return (StatusCode::BAD_REQUEST, message).into_response(),
+        Err(message) => {
+            let response = (StatusCode::BAD_REQUEST, message).into_response();
+            metrics.finish(false);
+            return response;
+        }
     };
 
-    match state.publish_group_application_message(&group_id, &sender, &recipients, body.to_vec()) {
+    let response = match state.publish_group_application_message(
+        &group_id,
+        &sender,
+        &recipients,
+        body.to_vec(),
+    ) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 async fn fetch_application_message(
     State(state): State<SharedRelay>,
     Path(recipient): Path<String>,
 ) -> Response {
-    match state.fetch_application_message(&recipient) {
+    let metrics = state.metrics().start("fetch_application_message");
+    let response = match state.fetch_application_message(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 fn parse_recipients_header(value: &HeaderValue) -> Result<Vec<String>, String> {

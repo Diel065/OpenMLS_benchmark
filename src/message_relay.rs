@@ -2,6 +2,7 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::debug::debug_logs_enabled;
+use crate::service_metrics::ServiceMetrics;
 
 #[derive(Clone, Debug)]
 struct RelayEnvelope {
@@ -12,13 +13,19 @@ struct RelayEnvelope {
 
 pub struct MessageRelay {
     application_inboxes: RwLock<HashMap<String, Arc<Mutex<VecDeque<RelayEnvelope>>>>>,
+    metrics: ServiceMetrics,
 }
 
 impl MessageRelay {
     pub fn new() -> Self {
         Self {
             application_inboxes: RwLock::new(HashMap::new()),
+            metrics: ServiceMetrics::new(),
         }
+    }
+
+    pub fn metrics(&self) -> &ServiceMetrics {
+        &self.metrics
     }
 
     pub fn publish_group_application_message(

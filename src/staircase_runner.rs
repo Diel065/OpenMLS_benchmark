@@ -1,16 +1,19 @@
 use std::{
-    collections::VecDeque,
+    collections::{HashMap, VecDeque},
     error::Error as StdError,
     fs::{self, File},
     future::Future,
     io::{self, BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        Arc,
+    },
     time::{Duration, Instant},
 };
 
 use anyhow::{anyhow, Context, Result};
-use futures_util::future::{join_all, try_join_all};
+use futures_util::stream::{self, StreamExt};
 use rand::{thread_rng, Rng};
 use serde::{Deserialize, Serialize};
 
@@ -18,16 +21,22 @@ use crate::http_retry::{
     is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
     retry_transient_http_async, RetryDecision,
 };
+use crate::worker_api::PendingKind;
 use crate::worker_api::{Command, CommandRequestEnvelope, CommandResponse};
 
 const WORKER_COMMAND_MAX_ATTEMPTS: usize = 10;
 const WORKER_COMMAND_INITIAL_DELAY: Duration = Duration::from_millis(100);
 const WORKER_COMMAND_MAX_DELAY: Duration = Duration::from_secs(3);
-const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 32;
+const DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST: usize = 4;
 const DEFAULT_MAX_FANOUT_PARALLELISM: usize = 32;
-const ADAPTIVE_FANOUT_START: usize = 32;
+const DEFAULT_MIN_FANOUT_PARALLELISM: usize = 1;
+const ADAPTIVE_FANOUT_START: usize = 16;
 const FANOUT_LATENCY_SPIKE_P95_MS: u128 = 5_000;
 const FANOUT_STABLE_INCREASE_AFTER: usize = 20;
+const DEFAULT_FANOUT_ERROR_RATE_THRESHOLD: f64 = 0.02;
+const DEFAULT_RUNNER_HTTP_CONNECT_TIMEOUT_MS: u64 = 2_000;
+const DEFAULT_RUNNER_HTTP_REQUEST_TIMEOUT_MS: u64 = 20_000;
+const DEFAULT_FANOUT_RETRY_PASSES: usize = 1;
 
 static WORKER_COMMAND_REQUEST_COUNTER: AtomicU64 = AtomicU64::new(1);
 
@@ -51,8 +60,12 @@ pub struct StaircaseConfig {
     pub worker_health_timeout_seconds: u64,
     pub worker_health_poll_ms: u64,
     pub max_fanout_parallelism: usize,
-    pub fanout_adaptive: bool,
+    pub min_fanout_parallelism: usize,
+    pub fanout_adaptive: Option<bool>,
+    pub fanout_error_rate_threshold: f64,
+    pub fanout_p95_threshold_ms: u128,
     pub http_pool_max_idle_per_host: usize,
+    pub process_pending_fanout: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -75,15 +88,22 @@ pub struct NetworkPhaseMetrics {
     pub operation: String,
     pub request_count: usize,
     pub recipient_count: usize,
+    pub success_count: usize,
+    pub failure_count: usize,
+    pub timeout_count: usize,
+    pub connect_error_count: usize,
     pub max_parallelism: usize,
+    pub effective_parallelism: usize,
     pub wall_ms: u128,
     pub retry_count: usize,
     pub retry_sleep_ms: u128,
+    pub retry_pass_count: usize,
     pub failures: usize,
     pub worker_latency_p50_ms: Option<u128>,
     pub worker_latency_p95_ms: Option<u128>,
     pub worker_latency_p99_ms: Option<u128>,
     pub worker_latency_max_ms: Option<u128>,
+    pub slowest_worker_ids: Vec<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -184,25 +204,40 @@ impl Progress {
 #[derive(Debug)]
 struct FanoutController {
     max_parallelism: usize,
+    min_parallelism: usize,
     current_parallelism: usize,
     adaptive: bool,
     stable_successes: usize,
+    error_rate_threshold: f64,
+    p95_threshold_ms: u128,
 }
 
 impl FanoutController {
-    fn new(max_parallelism: usize, adaptive: bool) -> Self {
+    fn new(
+        max_parallelism: usize,
+        min_parallelism: usize,
+        adaptive: bool,
+        error_rate_threshold: f64,
+        p95_threshold_ms: u128,
+    ) -> Self {
         let max_parallelism = max_parallelism.max(1);
+        let min_parallelism = min_parallelism.clamp(1, max_parallelism);
         let current_parallelism = if adaptive {
-            ADAPTIVE_FANOUT_START.min(max_parallelism).max(1)
+            ADAPTIVE_FANOUT_START
+                .min(max_parallelism)
+                .max(min_parallelism)
         } else {
             max_parallelism
         };
 
         Self {
             max_parallelism,
+            min_parallelism,
             current_parallelism,
             adaptive,
             stable_successes: 0,
+            error_rate_threshold,
+            p95_threshold_ms,
         }
     }
 
@@ -216,22 +251,31 @@ impl FanoutController {
         }
 
         let p95 = summary.latency_p95_ms.unwrap_or(0);
-        let should_reduce = summary.failures > 0 || p95 >= FANOUT_LATENCY_SPIKE_P95_MS;
+        let error_rate = if summary.request_count == 0 {
+            0.0
+        } else {
+            summary.failure_count as f64 / summary.request_count as f64
+        };
+        let latency_spike = p95 >= self.p95_threshold_ms;
+        let error_spike = error_rate >= self.error_rate_threshold && summary.failure_count > 0;
+        let should_reduce = latency_spike || error_spike;
 
         if should_reduce {
             let previous = self.current_parallelism;
-            self.current_parallelism = (self.current_parallelism / 2).max(1);
+            self.current_parallelism = (self.current_parallelism / 2).max(self.min_parallelism);
             self.stable_successes = 0;
 
             if self.current_parallelism != previous {
                 eprintln!(
-                    "[fanout-adaptive] phase={} operation={} reducing parallelism {} -> {} failures={} p95_ms={}",
+                    "[fanout-adaptive] phase={} operation={} reducing parallelism {} -> {} failures={} error_rate={:.4} p95_ms={} reason={}",
                     phase,
                     operation,
                     previous,
                     self.current_parallelism,
-                    summary.failures,
-                    p95
+                    summary.failure_count,
+                    error_rate,
+                    p95,
+                    if error_spike { "error_rate" } else { "p95_latency" }
                 );
             }
             return;
@@ -246,8 +290,13 @@ impl FanoutController {
             self.stable_successes = 0;
 
             eprintln!(
-                "[fanout-adaptive] phase={} operation={} increasing parallelism {} -> {} p95_ms={}",
-                phase, operation, previous, self.current_parallelism, p95
+                "[fanout-adaptive] phase={} operation={} increasing parallelism {} -> {} p95_ms={} stable_successes={}",
+                phase,
+                operation,
+                previous,
+                self.current_parallelism,
+                p95,
+                FANOUT_STABLE_INCREASE_AFTER
             );
         }
     }
@@ -256,12 +305,20 @@ impl FanoutController {
 #[derive(Debug, Clone, Default)]
 struct FanoutSummary {
     request_count: usize,
-    failures: usize,
+    recipient_count: usize,
+    success_count: usize,
+    failure_count: usize,
+    timeout_count: usize,
+    connect_error_count: usize,
+    max_parallelism: usize,
+    effective_parallelism: usize,
+    retry_pass_count: usize,
     wall_ms: u128,
     latency_p50_ms: Option<u128>,
     latency_p95_ms: Option<u128>,
     latency_p99_ms: Option<u128>,
     latency_max_ms: Option<u128>,
+    slowest_worker_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -342,23 +399,43 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
     fs::create_dir_all(&run_dir)?;
 
     let max_fanout_parallelism = effective_max_fanout_parallelism(config.max_fanout_parallelism);
-    let mut fanout = FanoutController::new(max_fanout_parallelism, config.fanout_adaptive);
+    let min_fanout_parallelism =
+        effective_min_fanout_parallelism(config.min_fanout_parallelism, max_fanout_parallelism);
+    let fanout_adaptive = effective_fanout_adaptive(config.fanout_adaptive, config.workers.len());
+    let fanout_error_rate_threshold =
+        effective_fanout_error_rate_threshold(config.fanout_error_rate_threshold);
+    let fanout_p95_threshold_ms = effective_fanout_p95_threshold_ms(config.fanout_p95_threshold_ms);
+    let mut fanout = FanoutController::new(
+        max_fanout_parallelism,
+        min_fanout_parallelism,
+        fanout_adaptive,
+        fanout_error_rate_threshold,
+        fanout_p95_threshold_ms,
+    );
     let http_pool_max_idle_per_host =
         effective_http_pool_max_idle_per_host(config.http_pool_max_idle_per_host);
+    let runner_http_connect_timeout = Duration::from_millis(runner_http_connect_timeout_ms());
+    let runner_http_request_timeout = Duration::from_millis(runner_http_request_timeout_ms());
 
     eprintln!(
-        "[network] runner http_pool_max_idle_per_host={} max_fanout_parallelism={} fanout_adaptive={} initial_effective_fanout_parallelism={}",
+        "[network] runner http_pool_max_idle_per_host={} connect_timeout_ms={} request_timeout_ms={} max_fanout_parallelism={} min_fanout_parallelism={} fanout_adaptive={} initial_effective_fanout_parallelism={} fanout_error_rate_threshold={:.4} fanout_p95_threshold_ms={} process_pending_fanout={}",
         http_pool_max_idle_per_host,
+        runner_http_connect_timeout.as_millis(),
+        runner_http_request_timeout.as_millis(),
         max_fanout_parallelism,
-        config.fanout_adaptive,
-        fanout.parallelism()
+        min_fanout_parallelism,
+        fanout_adaptive,
+        fanout.parallelism(),
+        fanout_error_rate_threshold,
+        fanout_p95_threshold_ms,
+        config.process_pending_fanout
     );
 
     let http = reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(runner_http_connect_timeout)
+        .timeout(runner_http_request_timeout)
         .pool_max_idle_per_host(http_pool_max_idle_per_host)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .build()
         .context("Failed to build HTTP client")?;
@@ -446,6 +523,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             target_size,
             &mut fanout,
             &mut progress,
+            config.process_pending_fanout,
         )
         .await?;
 
@@ -464,6 +542,7 @@ async fn run_staircase_benchmark_async(config: StaircaseConfig) -> Result<()> {
             config.max_update_samples_per_plateau,
             &mut fanout,
             &mut progress,
+            config.process_pending_fanout,
         )
         .await?;
 
@@ -509,12 +588,56 @@ fn effective_max_fanout_parallelism(configured: usize) -> usize {
     DEFAULT_MAX_FANOUT_PARALLELISM
 }
 
+fn effective_min_fanout_parallelism(configured: usize, max_parallelism: usize) -> usize {
+    let value = if configured > 0 {
+        configured
+    } else {
+        DEFAULT_MIN_FANOUT_PARALLELISM
+    };
+
+    value.clamp(1, max_parallelism.max(1))
+}
+
+fn effective_fanout_adaptive(configured: Option<bool>, worker_count: usize) -> bool {
+    configured.unwrap_or(worker_count >= 256)
+}
+
+fn effective_fanout_error_rate_threshold(configured: f64) -> f64 {
+    if configured.is_finite() && configured > 0.0 {
+        configured
+    } else {
+        DEFAULT_FANOUT_ERROR_RATE_THRESHOLD
+    }
+}
+
+fn effective_fanout_p95_threshold_ms(configured: u128) -> u128 {
+    if configured > 0 {
+        configured
+    } else {
+        FANOUT_LATENCY_SPIKE_P95_MS
+    }
+}
+
 fn effective_http_pool_max_idle_per_host(configured: usize) -> usize {
     if configured > 0 {
         configured
     } else {
         DEFAULT_HTTP_POOL_MAX_IDLE_PER_HOST
     }
+}
+
+fn runner_http_connect_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_RUNNER_HTTP_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_RUNNER_HTTP_CONNECT_TIMEOUT_MS)
+}
+
+fn runner_http_request_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_RUNNER_HTTP_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(DEFAULT_RUNNER_HTTP_REQUEST_TIMEOUT_MS)
 }
 
 fn format_hms(d: Duration) -> String {
@@ -594,30 +717,42 @@ async fn wait_for_all_workers_healthy(
 
     while start.elapsed() < timeout {
         let mut still_unhealthy = Vec::new();
+        let mut latencies = Vec::new();
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let remaining_snapshot = remaining.clone();
 
-        for chunk in remaining.chunks(max_parallelism) {
-            let probes = chunk.iter().map(|&idx| {
+        let mut probes = stream::iter(remaining_snapshot.into_iter())
+            .map(|idx| {
                 let worker = &workers[idx];
+                let in_flight = Arc::clone(&in_flight);
+                let max_in_flight = Arc::clone(&max_in_flight);
                 async move {
+                    let command_started = Instant::now();
+                    let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                    update_atomic_max(&max_in_flight, current);
                     let url = format!("{}/health", worker.url.trim_end_matches('/'));
                     let healthy = matches!(
                         http.get(&url).send().await,
                         Ok(resp) if resp.status().is_success()
                     );
-                    Ok::<_, anyhow::Error>((idx, healthy))
+                    in_flight.fetch_sub(1, Ordering::SeqCst);
+                    (idx, healthy, command_started.elapsed().as_millis())
                 }
-            });
+            })
+            .buffer_unordered(max_parallelism);
 
-            for (idx, healthy) in try_join_all(probes).await? {
-                if !healthy {
-                    still_unhealthy.push(idx);
-                }
+        while let Some((idx, healthy, latency_ms)) = probes.next().await {
+            latencies.push(latency_ms);
+            if !healthy {
+                still_unhealthy.push(idx);
             }
         }
 
         let healthy_count = workers.len().saturating_sub(still_unhealthy.len());
 
         if still_unhealthy.is_empty() {
+            let (p50, p95, p99, max) = latency_percentiles(latencies);
             eprintln!(
                 "[preflight] all {} workers are healthy after {}",
                 workers.len(),
@@ -629,15 +764,22 @@ async fn wait_for_all_workers_healthy(
                 operation: "worker_health".to_string(),
                 request_count: workers.len(),
                 recipient_count: workers.len(),
+                success_count: workers.len(),
+                failure_count: 0,
+                timeout_count: 0,
+                connect_error_count: 0,
                 max_parallelism,
+                effective_parallelism: max_in_flight.load(Ordering::SeqCst),
                 wall_ms: start.elapsed().as_millis(),
                 retry_count: 0,
                 retry_sleep_ms: 0,
+                retry_pass_count: 0,
                 failures: 0,
-                worker_latency_p50_ms: None,
-                worker_latency_p95_ms: None,
-                worker_latency_p99_ms: None,
-                worker_latency_max_ms: None,
+                worker_latency_p50_ms: p50,
+                worker_latency_p95_ms: p95,
+                worker_latency_p99_ms: p99,
+                worker_latency_max_ms: max,
+                slowest_worker_ids: Vec::new(),
             });
             return Ok(());
         }
@@ -679,15 +821,26 @@ async fn wait_for_all_workers_healthy(
         operation: "worker_health".to_string(),
         request_count: workers.len(),
         recipient_count: workers.len(),
+        success_count: workers.len().saturating_sub(remaining.len()),
+        failure_count: remaining.len(),
+        timeout_count: 0,
+        connect_error_count: 0,
         max_parallelism,
+        effective_parallelism: max_parallelism.min(workers.len()),
         wall_ms: start.elapsed().as_millis(),
         retry_count: 0,
         retry_sleep_ms: 0,
+        retry_pass_count: 0,
         failures: remaining.len(),
         worker_latency_p50_ms: None,
         worker_latency_p95_ms: None,
         worker_latency_p99_ms: None,
         worker_latency_max_ms: None,
+        slowest_worker_ids: remaining
+            .iter()
+            .take(5)
+            .map(|&idx| workers[idx].id.clone())
+            .collect(),
     });
 
     Err(anyhow!(
@@ -1298,6 +1451,185 @@ async fn receive_commit_expect(
     }
 }
 
+async fn expected_receive_commit_state_reached(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    expected: &ExpectedReceiveCommitState,
+) -> Result<bool> {
+    match show_group_state(http, worker).await {
+        Ok(snapshot) => match expected {
+            ExpectedReceiveCommitState::Group(expected_state) => {
+                Ok(expected_state.matches(&snapshot))
+            }
+            ExpectedReceiveCommitState::Removed { expected_epoch } => Err(anyhow!(
+                "worker {} was expected to be removed after epoch {}, but ShowGroupState returned group_id={} epoch={} members={:?}",
+                worker.id,
+                expected_epoch,
+                snapshot.group_id,
+                snapshot.epoch,
+                snapshot.members
+            )),
+        },
+        Err(err) => {
+            let text = format!("{:#}", err);
+            if matches!(expected, ExpectedReceiveCommitState::Removed { .. })
+                && text.contains("Client is not in a group")
+            {
+                return Ok(true);
+            }
+
+            Err(anyhow!(
+                "could not query worker {} state after ProcessPending: {}",
+                worker.id,
+                text
+            ))
+        }
+    }
+}
+
+async fn receive_application_message_expect(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    profile: bool,
+    phase: &str,
+) -> Result<()> {
+    let command = Command::ReceiveApplicationMessage { profile };
+    let context = WorkerCommandContext::with_metadata(worker, &command, None, Some(phase));
+
+    match send_cmd_expect_ok_fragment_with_context(
+        http,
+        worker,
+        &command,
+        "application message received:",
+        &context,
+    )
+    .await
+    {
+        Ok(_) => Ok(()),
+        Err(err) => {
+            let is_ambiguous = err
+                .downcast_ref::<WorkerCommandError>()
+                .map(WorkerCommandError::is_ambiguous_transport)
+                .unwrap_or(false);
+
+            if !is_ambiguous {
+                return Err(err);
+            }
+
+            let original_error = format!("{:#}", err);
+            eprintln!(
+                "[reconcile] receive_application_message retrying same request_id={} worker={} phase={} after ambiguous transport error={}",
+                context.request_id, worker.id, phase, original_error
+            );
+
+            send_cmd_expect_ok_fragment_with_context(
+                http,
+                worker,
+                &command,
+                "application message received:",
+                &context,
+            )
+            .await
+            .map(|_| ())
+            .with_context(|| {
+                format!(
+                    "receive_application_message failed after ambiguous transport retry: worker={} request_id={} phase={} initial_error={}",
+                    worker.id, context.request_id, phase, original_error
+                )
+            })
+        }
+    }
+}
+
+async fn process_pending_commit_expect(
+    http: &reqwest::Client,
+    worker: &WorkerSpec,
+    expected: ExpectedReceiveCommitState,
+    phase: &str,
+) -> Result<()> {
+    let command = Command::ProcessPending {
+        kinds: Some(vec![PendingKind::Commits]),
+        max_messages: Some(8),
+        expected_epoch: expected_epoch(&expected),
+    };
+    let context = WorkerCommandContext::with_metadata(
+        worker,
+        &command,
+        expected_epoch(&expected),
+        Some(phase),
+    );
+
+    match send_cmd_expect_ok_fragment_with_context(
+        http,
+        worker,
+        &command,
+        "process_pending processed;",
+        &context,
+    )
+    .await
+    {
+        Ok(_) => {
+            if expected_receive_commit_state_reached(http, worker, &expected).await? {
+                Ok(())
+            } else {
+                Err(anyhow!(
+                    "process_pending completed but worker {} did not reach expected state",
+                    worker.id
+                ))
+            }
+        }
+        Err(err) => {
+            let original_error = format!("{:#}", err);
+            if receive_commit_reconciled_by_state(http, worker, &expected, &original_error).await? {
+                return Ok(());
+            }
+
+            eprintln!(
+                "[reconcile] process_pending retrying same request_id={} worker={} phase={} after failure",
+                context.request_id, worker.id, phase
+            );
+
+            match send_cmd_expect_ok_fragment_with_context(
+                http,
+                worker,
+                &command,
+                "process_pending processed;",
+                &context,
+            )
+            .await
+            {
+                Ok(_) => {
+                    if expected_receive_commit_state_reached(http, worker, &expected).await? {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "process_pending retry completed but worker {} did not reach expected state",
+                            worker.id
+                        ))
+                    }
+                }
+                Err(retry_err) => {
+                    let retry_error = format!("{:#}", retry_err);
+                    if receive_commit_reconciled_by_state(http, worker, &expected, &retry_error)
+                        .await?
+                    {
+                        return Ok(());
+                    }
+
+                    Err(anyhow!(
+                        "process_pending failed after reconciliation retry: worker={} request_id={} phase={} initial_error={} retry_error={}",
+                        worker.id,
+                        context.request_id,
+                        phase,
+                        original_error,
+                        retry_error
+                    ))
+                }
+            }
+        }
+    }
+}
+
 async fn ensure_converged(
     http: &reqwest::Client,
     active_workers: &[WorkerSpec],
@@ -1311,7 +1643,6 @@ async fn ensure_converged(
     let mut expected_members = expected_active_ids.to_vec();
     expected_members.sort();
 
-    let started = Instant::now();
     let states = collect_worker_group_states(http, active_workers, max_parallelism).await?;
     let (reference_worker, reference) = states
         .first()
@@ -1344,23 +1675,6 @@ async fn ensure_converged(
         }
     }
 
-    emit_network_metrics(NetworkPhaseMetrics {
-        phase: "convergence".to_string(),
-        group_size: active_workers.len(),
-        operation: "show_group_state".to_string(),
-        request_count: active_workers.len(),
-        recipient_count: active_workers.len(),
-        max_parallelism: max_parallelism.max(1),
-        wall_ms: started.elapsed().as_millis(),
-        retry_count: 0,
-        retry_sleep_ms: 0,
-        failures: 0,
-        worker_latency_p50_ms: None,
-        worker_latency_p95_ms: None,
-        worker_latency_p99_ms: None,
-        worker_latency_max_ms: None,
-    });
-
     Ok(reference.clone())
 }
 
@@ -1370,18 +1684,46 @@ async fn collect_worker_group_states(
     max_parallelism: usize,
 ) -> Result<Vec<(WorkerSpec, GroupStateSnapshot)>> {
     let max_parallelism = max_parallelism.max(1);
-    let mut states = Vec::with_capacity(workers.len());
+    let collect = fanout_collect_workers(
+        "convergence",
+        workers.len(),
+        "show_group_state",
+        workers,
+        max_parallelism,
+        |worker| async move { show_group_state(http, &worker).await },
+    )
+    .await;
 
-    for chunk in workers.chunks(max_parallelism) {
-        let futures = chunk.iter().cloned().map(|worker| async move {
-            let state = show_group_state(http, &worker).await?;
-            Ok::<_, anyhow::Error>((worker, state))
-        });
+    emit_fanout_metrics(
+        "convergence",
+        workers.len(),
+        "show_group_state",
+        &collect.summary,
+    );
 
-        states.extend(try_join_all(futures).await?);
+    if !collect.failures.is_empty() {
+        return Err(anyhow!(
+            "convergence ShowGroupState failed_workers={} max_parallelism={} failures=[{}]",
+            collect.failures.len(),
+            max_parallelism,
+            format_fanout_failures(&collect.failures)
+        ));
     }
 
-    Ok(states)
+    let mut by_id = HashMap::with_capacity(collect.successes.len());
+    for (worker, state) in collect.successes {
+        by_id.insert(worker.id.clone(), (worker, state));
+    }
+
+    let mut ordered = Vec::with_capacity(workers.len());
+    for worker in workers {
+        let state = by_id
+            .remove(&worker.id)
+            .ok_or_else(|| anyhow!("Missing ShowGroupState result for worker {}", worker.id))?;
+        ordered.push(state);
+    }
+
+    Ok(ordered)
 }
 
 fn latency_percentiles(
@@ -1415,82 +1757,266 @@ where
     F: Fn(WorkerSpec) -> Fut,
     Fut: Future<Output = Result<()>>,
 {
-    let started = Instant::now();
     let max_parallelism = fanout.parallelism();
-    let mut failures = Vec::new();
-    let mut latencies = Vec::with_capacity(workers.len());
+    let collect =
+        fanout_collect_workers(phase, group_size, operation, workers, max_parallelism, op).await;
 
-    for chunk in workers.chunks(max_parallelism) {
-        let futures = chunk.iter().cloned().map(|worker| {
-            let worker_for_result = worker.clone();
-            let future = op(worker);
-            async move {
-                let command_started = Instant::now();
-                let result = future.await;
-                (
-                    worker_for_result,
-                    command_started.elapsed().as_millis(),
-                    result,
-                )
-            }
-        });
+    emit_fanout_metrics(phase, group_size, operation, &collect.summary);
+    fanout.record(phase, operation, &collect.summary);
 
-        for (worker, latency_ms, result) in join_all(futures).await {
-            latencies.push(latency_ms);
-
-            if let Err(err) = result {
-                failures.push((worker, err));
-            }
-        }
-    }
-
-    let (p50, p95, p99, max) = latency_percentiles(latencies);
-    let summary = FanoutSummary {
-        request_count: workers.len(),
-        failures: failures.len(),
-        wall_ms: started.elapsed().as_millis(),
-        latency_p50_ms: p50,
-        latency_p95_ms: p95,
-        latency_p99_ms: p99,
-        latency_max_ms: max,
-    };
-
-    emit_network_metrics(NetworkPhaseMetrics {
-        phase: phase.to_string(),
-        group_size,
-        operation: operation.to_string(),
-        request_count: summary.request_count,
-        recipient_count: workers.len(),
-        max_parallelism,
-        wall_ms: summary.wall_ms,
-        retry_count: 0,
-        retry_sleep_ms: 0,
-        failures: summary.failures,
-        worker_latency_p50_ms: summary.latency_p50_ms,
-        worker_latency_p95_ms: summary.latency_p95_ms,
-        worker_latency_p99_ms: summary.latency_p99_ms,
-        worker_latency_max_ms: summary.latency_max_ms,
-    });
-    fanout.record(phase, operation, &summary);
-
-    if failures.is_empty() {
+    if collect.failures.is_empty() {
         return Ok(());
     }
-
-    let details = failures
-        .iter()
-        .map(|(worker, err)| format!("{}: {:#}", worker.id, err))
-        .collect::<Vec<_>>()
-        .join("; ");
 
     Err(anyhow!(
         "fanout phase={} operation={} failed_workers={} max_parallelism={} failures=[{}]",
         phase,
         operation,
-        failures.len(),
+        collect.failures.len(),
         max_parallelism,
-        details
+        format_fanout_failures(&collect.failures)
     ))
+}
+
+#[derive(Debug)]
+struct FanoutFailure {
+    worker: WorkerSpec,
+    error: anyhow::Error,
+}
+
+#[derive(Debug)]
+struct FanoutAttempt<T> {
+    worker: WorkerSpec,
+    latency_ms: u128,
+    result: Result<T>,
+}
+
+#[derive(Debug)]
+struct FanoutCollect<T> {
+    successes: Vec<(WorkerSpec, T)>,
+    failures: Vec<FanoutFailure>,
+    summary: FanoutSummary,
+}
+
+async fn fanout_collect_workers<F, Fut, T>(
+    phase: &str,
+    group_size: usize,
+    operation: &str,
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+    op: F,
+) -> FanoutCollect<T>
+where
+    F: Fn(WorkerSpec) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let started = Instant::now();
+    let max_parallelism = max_parallelism.max(1);
+    let mut request_count = 0usize;
+    let mut retry_pass_count = 0usize;
+    let mut effective_parallelism = 0usize;
+    let mut latencies = Vec::new();
+    let mut successes = Vec::with_capacity(workers.len());
+
+    let first_pass = run_fanout_pass(workers, max_parallelism, &op).await;
+    request_count += first_pass.0.len();
+    effective_parallelism = effective_parallelism.max(first_pass.1);
+
+    let mut retry_workers = Vec::new();
+    for attempt in first_pass.0 {
+        latencies.push((attempt.worker.id.clone(), attempt.latency_ms));
+        match attempt.result {
+            Ok(value) => successes.push((attempt.worker, value)),
+            Err(error) => retry_workers.push(FanoutFailure {
+                worker: attempt.worker,
+                error,
+            }),
+        }
+    }
+
+    for retry_pass in 1..=DEFAULT_FANOUT_RETRY_PASSES {
+        if retry_workers.is_empty() {
+            break;
+        }
+
+        eprintln!(
+            "[fanout-retry] phase={} group_size={} operation={} pass={} retry_workers={}",
+            phase,
+            group_size,
+            operation,
+            retry_pass,
+            retry_workers.len()
+        );
+
+        retry_pass_count += 1;
+        let retry_inputs = retry_workers
+            .iter()
+            .map(|failure| failure.worker.clone())
+            .collect::<Vec<_>>();
+        retry_workers.clear();
+
+        let retry_pass = run_fanout_pass(&retry_inputs, max_parallelism, &op).await;
+        request_count += retry_pass.0.len();
+        effective_parallelism = effective_parallelism.max(retry_pass.1);
+
+        for attempt in retry_pass.0 {
+            latencies.push((attempt.worker.id.clone(), attempt.latency_ms));
+            match attempt.result {
+                Ok(value) => successes.push((attempt.worker, value)),
+                Err(error) => retry_workers.push(FanoutFailure {
+                    worker: attempt.worker,
+                    error,
+                }),
+            }
+        }
+    }
+
+    let failures = retry_workers;
+
+    let latency_values = latencies.iter().map(|(_, ms)| *ms).collect::<Vec<_>>();
+    let (p50, p95, p99, max) = latency_percentiles(latency_values);
+    latencies.sort_by(|left, right| right.1.cmp(&left.1));
+    let slowest_worker_ids = latencies
+        .iter()
+        .take(5)
+        .map(|(worker_id, latency_ms)| format!("{}:{}ms", worker_id, latency_ms))
+        .collect::<Vec<_>>();
+
+    let (timeout_count, connect_error_count) = classify_fanout_failures(&failures);
+    let summary = FanoutSummary {
+        request_count,
+        recipient_count: workers.len(),
+        success_count: successes.len(),
+        failure_count: failures.len(),
+        timeout_count,
+        connect_error_count,
+        max_parallelism,
+        effective_parallelism,
+        retry_pass_count,
+        wall_ms: started.elapsed().as_millis(),
+        latency_p50_ms: p50,
+        latency_p95_ms: p95,
+        latency_p99_ms: p99,
+        latency_max_ms: max,
+        slowest_worker_ids,
+    };
+
+    FanoutCollect {
+        successes,
+        failures,
+        summary,
+    }
+}
+
+async fn run_fanout_pass<F, Fut, T>(
+    workers: &[WorkerSpec],
+    max_parallelism: usize,
+    op: &F,
+) -> (Vec<FanoutAttempt<T>>, usize)
+where
+    F: Fn(WorkerSpec) -> Fut,
+    Fut: Future<Output = Result<T>>,
+{
+    let in_flight = Arc::new(AtomicUsize::new(0));
+    let max_in_flight = Arc::new(AtomicUsize::new(0));
+
+    let mut results = stream::iter(workers.iter().cloned())
+        .map(|worker| {
+            let worker_for_result = worker.clone();
+            let future = op(worker);
+            let in_flight = Arc::clone(&in_flight);
+            let max_in_flight = Arc::clone(&max_in_flight);
+
+            async move {
+                let command_started = Instant::now();
+                let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+                update_atomic_max(&max_in_flight, current);
+                let result = future.await;
+                in_flight.fetch_sub(1, Ordering::SeqCst);
+
+                FanoutAttempt {
+                    worker: worker_for_result,
+                    latency_ms: command_started.elapsed().as_millis(),
+                    result,
+                }
+            }
+        })
+        .buffer_unordered(max_parallelism.max(1));
+
+    let mut attempts = Vec::with_capacity(workers.len());
+    while let Some(attempt) = results.next().await {
+        attempts.push(attempt);
+    }
+
+    (attempts, max_in_flight.load(Ordering::SeqCst))
+}
+
+fn update_atomic_max(max: &AtomicUsize, value: usize) {
+    let mut current = max.load(Ordering::SeqCst);
+    while value > current {
+        match max.compare_exchange(current, value, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => break,
+            Err(observed) => current = observed,
+        }
+    }
+}
+
+fn classify_fanout_failures(failures: &[FanoutFailure]) -> (usize, usize) {
+    failures
+        .iter()
+        .fold((0usize, 0usize), |(timeouts, connects), failure| {
+            let lower = format!("{:#}", failure.error).to_ascii_lowercase();
+            let is_timeout = lower.contains("timeout")
+                || lower.contains("timed out")
+                || lower.contains("deadline has elapsed");
+            let is_connect = lower.contains("host is unreachable")
+                || lower.contains("no route to host")
+                || lower.contains("network is unreachable")
+                || lower.contains("tcp connect")
+                || lower.contains("connect error")
+                || lower.contains("failed to connect")
+                || lower.contains("dns error")
+                || lower.contains("failed to resolve");
+
+            (
+                timeouts + usize::from(is_timeout),
+                connects + usize::from(is_connect),
+            )
+        })
+}
+
+fn format_fanout_failures(failures: &[FanoutFailure]) -> String {
+    failures
+        .iter()
+        .map(|failure| format!("{}: {:#}", failure.worker.id, failure.error))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+fn emit_fanout_metrics(phase: &str, group_size: usize, operation: &str, summary: &FanoutSummary) {
+    emit_network_metrics(NetworkPhaseMetrics {
+        phase: phase.to_string(),
+        group_size,
+        operation: operation.to_string(),
+        request_count: summary.request_count,
+        recipient_count: summary.recipient_count,
+        success_count: summary.success_count,
+        failure_count: summary.failure_count,
+        timeout_count: summary.timeout_count,
+        connect_error_count: summary.connect_error_count,
+        max_parallelism: summary.max_parallelism,
+        effective_parallelism: summary.effective_parallelism,
+        wall_ms: summary.wall_ms,
+        retry_count: 0,
+        retry_sleep_ms: 0,
+        retry_pass_count: summary.retry_pass_count,
+        failures: summary.failure_count,
+        worker_latency_p50_ms: summary.latency_p50_ms,
+        worker_latency_p95_ms: summary.latency_p95_ms,
+        worker_latency_p99_ms: summary.latency_p99_ms,
+        worker_latency_max_ms: summary.latency_max_ms,
+        slowest_worker_ids: summary.slowest_worker_ids.clone(),
+    });
 }
 
 fn emit_network_metrics(metrics: NetworkPhaseMetrics) {
@@ -1674,6 +2200,7 @@ async fn add_one_member(
     idle: &mut VecDeque<WorkerSpec>,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    process_pending_fanout: bool,
 ) -> Result<()> {
     let timeout = Duration::from_secs(30);
 
@@ -1708,14 +2235,24 @@ async fn add_one_member(
         "added locally in one commit",
     )
     .await?;
-    receive_commit_expect(
-        http,
-        &actor,
-        "own commit accepted from DS",
-        ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-        "add_member.actor_receive_commit",
-    )
-    .await?;
+    if process_pending_fanout {
+        process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "add_member.actor_process_pending",
+        )
+        .await?;
+    } else {
+        receive_commit_expect(
+            http,
+            &actor,
+            "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "add_member.actor_receive_commit",
+        )
+        .await?;
+    }
 
     let join_fragment = format!("{} joined from welcome", joiner.id);
     send_cmd_until_ok(
@@ -1743,14 +2280,24 @@ async fn add_one_member(
         |worker| {
             let expected = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
             async move {
-                receive_commit_expect(
-                    http,
-                    &worker,
-                    "external commit received and processed",
-                    expected,
-                    "add_member.fanout_receive_commit",
-                )
-                .await
+                if process_pending_fanout {
+                    process_pending_commit_expect(
+                        http,
+                        &worker,
+                        expected,
+                        "add_member.fanout_process_pending",
+                    )
+                    .await
+                } else {
+                    receive_commit_expect(
+                        http,
+                        &worker,
+                        "external commit received and processed",
+                        expected,
+                        "add_member.fanout_receive_commit",
+                    )
+                    .await
+                }
             }
         },
     )
@@ -1767,6 +2314,7 @@ async fn remove_one_member(
     idle: &mut VecDeque<WorkerSpec>,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    process_pending_fanout: bool,
 ) -> Result<()> {
     if active.len() <= 1 {
         return Err(anyhow!("Cannot remove the last remaining member"));
@@ -1805,14 +2353,24 @@ async fn remove_one_member(
     )
     .await?;
 
-    receive_commit_expect(
-        http,
-        &actor,
-        "own commit accepted from DS",
-        ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-        "remove_member.actor_receive_commit",
-    )
-    .await?;
+    if process_pending_fanout {
+        process_pending_commit_expect(
+            http,
+            &actor,
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "remove_member.actor_process_pending",
+        )
+        .await?;
+    } else {
+        receive_commit_expect(
+            http,
+            &actor,
+            "own commit accepted from DS",
+            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+            "remove_member.actor_receive_commit",
+        )
+        .await?;
+    }
 
     let recipients: Vec<WorkerSpec> = active
         .iter()
@@ -1835,14 +2393,24 @@ async fn remove_one_member(
             };
 
             async move {
-                receive_commit_expect(
-                    http,
-                    &worker,
-                    "external commit received and processed",
-                    expected,
-                    "remove_member.fanout_receive_commit",
-                )
-                .await
+                if process_pending_fanout {
+                    process_pending_commit_expect(
+                        http,
+                        &worker,
+                        expected,
+                        "remove_member.fanout_process_pending",
+                    )
+                    .await
+                } else {
+                    receive_commit_expect(
+                        http,
+                        &worker,
+                        "external commit received and processed",
+                        expected,
+                        "remove_member.fanout_receive_commit",
+                    )
+                    .await
+                }
             }
         },
     )
@@ -1865,13 +2433,14 @@ async fn transition_to_size(
     target_size: usize,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    process_pending_fanout: bool,
 ) -> Result<()> {
     while active.len() < target_size {
-        add_one_member(http, active, idle, fanout, progress).await?;
+        add_one_member(http, active, idle, fanout, progress, process_pending_fanout).await?;
     }
 
     while active.len() > target_size {
-        remove_one_member(http, active, idle, fanout, progress).await?;
+        remove_one_member(http, active, idle, fanout, progress, process_pending_fanout).await?;
     }
 
     Ok(())
@@ -1885,6 +2454,7 @@ async fn run_update_phase(
     max_update_samples_per_plateau: usize,
     fanout: &mut FanoutController,
     progress: &mut Progress,
+    process_pending_fanout: bool,
 ) -> Result<()> {
     let total_updates =
         update_ops_for_plateau(plateau_size, update_rounds, max_update_samples_per_plateau);
@@ -1915,14 +2485,24 @@ async fn run_update_phase(
         )
         .await?;
 
-        receive_commit_expect(
-            http,
-            actor,
-            "own commit accepted from DS",
-            ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
-            "update.actor_receive_commit",
-        )
-        .await?;
+        if process_pending_fanout {
+            process_pending_commit_expect(
+                http,
+                actor,
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "update.actor_process_pending",
+            )
+            .await?;
+        } else {
+            receive_commit_expect(
+                http,
+                actor,
+                "own commit accepted from DS",
+                ExpectedReceiveCommitState::Group(expected_after_commit.clone()),
+                "update.actor_receive_commit",
+            )
+            .await?;
+        }
 
         let recipients: Vec<WorkerSpec> = active
             .iter()
@@ -1939,14 +2519,24 @@ async fn run_update_phase(
             |worker| {
                 let expected = ExpectedReceiveCommitState::Group(expected_after_commit.clone());
                 async move {
-                    receive_commit_expect(
-                        http,
-                        &worker,
-                        "external commit received and processed",
-                        expected,
-                        "update.fanout_receive_commit",
-                    )
-                    .await
+                    if process_pending_fanout {
+                        process_pending_commit_expect(
+                            http,
+                            &worker,
+                            expected,
+                            "update.fanout_process_pending",
+                        )
+                        .await
+                    } else {
+                        receive_commit_expect(
+                            http,
+                            &worker,
+                            "external commit received and processed",
+                            expected,
+                            "update.fanout_receive_commit",
+                        )
+                        .await
+                    }
                 }
             },
         )
@@ -2033,14 +2623,13 @@ async fn run_application_phase(
                     let sampled_worker_id = sampled_worker_id.clone();
                     async move {
                         let profile = worker.id == sampled_worker_id;
-                        send_cmd_expect_ok_fragment(
+                        receive_application_message_expect(
                             http,
                             &worker,
-                            &Command::ReceiveApplicationMessage { profile },
-                            "application message received:",
+                            profile,
+                            "application.fanout_receive_application_message",
                         )
                         .await
-                        .map(|_| ())
                     }
                 },
             )
@@ -2192,10 +2781,14 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use std::time::Duration;
 
     use anyhow::anyhow;
 
-    use super::{fanout_workers, sampled_member_index, FanoutController, WorkerSpec};
+    use super::{
+        fanout_workers, sampled_member_index, FanoutController, WorkerSpec,
+        DEFAULT_FANOUT_ERROR_RATE_THRESHOLD, FANOUT_LATENCY_SPIKE_P95_MS,
+    };
 
     fn sampled_indices(member_count: usize, sample_count: usize) -> Vec<usize> {
         (0..sample_count)
@@ -2237,7 +2830,13 @@ mod tests {
             .collect::<Vec<_>>();
 
         let attempts = Arc::new(AtomicUsize::new(0));
-        let mut fanout = FanoutController::new(4, false);
+        let mut fanout = FanoutController::new(
+            4,
+            1,
+            false,
+            DEFAULT_FANOUT_ERROR_RATE_THRESHOLD,
+            FANOUT_LATENCY_SPIKE_P95_MS,
+        );
         let attempts_for_op = attempts.clone();
 
         let result = fanout_workers(
@@ -2261,6 +2860,61 @@ mod tests {
         .await;
 
         assert!(result.is_err());
-        assert_eq!(attempts.load(Ordering::SeqCst), workers.len());
+        assert_eq!(attempts.load(Ordering::SeqCst), workers.len() + 1);
+    }
+
+    #[tokio::test]
+    async fn fanout_starts_later_workers_when_one_slot_is_slow() {
+        let workers = (1..=4)
+            .map(|idx| WorkerSpec {
+                id: format!("{idx:05}"),
+                url: format!("http://worker-{idx:05}:8080"),
+            })
+            .collect::<Vec<_>>();
+
+        let slow_finished = Arc::new(AtomicUsize::new(0));
+        let later_started_before_slow_finished = Arc::new(AtomicUsize::new(0));
+        let mut fanout = FanoutController::new(
+            2,
+            1,
+            false,
+            DEFAULT_FANOUT_ERROR_RATE_THRESHOLD,
+            FANOUT_LATENCY_SPIKE_P95_MS,
+        );
+
+        let slow_finished_for_op = Arc::clone(&slow_finished);
+        let later_started_for_op = Arc::clone(&later_started_before_slow_finished);
+
+        fanout_workers(
+            "test",
+            workers.len(),
+            "unordered",
+            &workers,
+            &mut fanout,
+            move |worker| {
+                let slow_finished = Arc::clone(&slow_finished_for_op);
+                let later_started = Arc::clone(&later_started_for_op);
+                async move {
+                    match worker.id.as_str() {
+                        "00001" => tokio::time::sleep(Duration::from_millis(10)).await,
+                        "00002" => {
+                            tokio::time::sleep(Duration::from_millis(100)).await;
+                            slow_finished.store(1, Ordering::SeqCst);
+                        }
+                        "00003" => {
+                            if slow_finished.load(Ordering::SeqCst) == 0 {
+                                later_started.store(1, Ordering::SeqCst);
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("synthetic fanout should succeed");
+
+        assert_eq!(later_started_before_slow_finished.load(Ordering::SeqCst), 1);
     }
 }

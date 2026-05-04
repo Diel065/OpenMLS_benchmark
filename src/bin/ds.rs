@@ -5,7 +5,7 @@ use anyhow::{anyhow, Result};
 use axum::{
     body::Bytes,
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue, StatusCode, Uri},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
@@ -59,11 +59,13 @@ async fn main() -> Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/metrics", get(metrics))
         .route(
             "/keypackage/{owner}",
             post(publish_key_package).get(fetch_key_package),
         )
         .route("/commit/{recipient}", get(fetch_commit))
+        .route("/commits/pending", get(fetch_pending_commits))
         .route(
             "/welcome/{recipient}",
             post(publish_welcome).get(fetch_welcome),
@@ -97,23 +99,34 @@ async fn health() -> &'static str {
     "ok"
 }
 
+async fn metrics(
+    State(state): State<SharedDs>,
+) -> Json<mls_playground::service_metrics::ServiceMetricsSnapshot> {
+    Json(state.metrics().snapshot())
+}
+
 async fn publish_key_package(
     State(state): State<SharedDs>,
     Path(owner): Path<String>,
     body: Bytes,
 ) -> StatusCode {
+    let metrics = state.metrics().start("publish_key_package");
     state.publish_key_package(&owner, body.to_vec());
     if debug_logs_enabled() {
         println!("[DS] Stored KeyPackage for {}", owner);
     }
+    metrics.finish(false);
     StatusCode::OK
 }
 
 async fn fetch_key_package(State(state): State<SharedDs>, Path(owner): Path<String>) -> Response {
-    match state.fetch_key_package(&owner) {
+    let metrics = state.metrics().start("fetch_key_package");
+    let response = match state.fetch_key_package(&owner) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 async fn put_group_state(
@@ -121,7 +134,8 @@ async fn put_group_state(
     Path((group_id, epoch)): Path<(String, u64)>,
     Json(body): Json<GroupStatePutRequest>,
 ) -> Response {
-    match state.put_group_state(&group_id, epoch, body.members) {
+    let metrics = state.metrics().start("put_group_state");
+    let response = match state.put_group_state(&group_id, epoch, body.members) {
         Ok(()) => {
             if debug_logs_enabled() {
                 println!(
@@ -132,11 +146,14 @@ async fn put_group_state(
             StatusCode::OK.into_response()
         }
         Err(message) => (StatusCode::CONFLICT, message).into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 async fn get_group_state(State(state): State<SharedDs>, Path(group_id): Path<String>) -> Response {
-    match state.get_group_state(&group_id) {
+    let metrics = state.metrics().start("get_group_state");
+    let response = match state.get_group_state(&group_id) {
         Some(GroupInfo {
             current_epoch,
             members,
@@ -147,7 +164,9 @@ async fn get_group_state(State(state): State<SharedDs>, Path(group_id): Path<Str
         })
         .into_response(),
         None => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 async fn publish_group_commit(
@@ -155,17 +174,62 @@ async fn publish_group_commit(
     Path((group_id, sender, epoch)): Path<(String, String, u64)>,
     body: Bytes,
 ) -> Response {
-    match state.publish_group_commit(&group_id, &sender, epoch, body.to_vec()) {
+    let metrics = state.metrics().start("publish_group_commit");
+    let response = match state.publish_group_commit(&group_id, &sender, epoch, body.to_vec()) {
         Ok(()) => StatusCode::OK.into_response(),
         Err(message) => (StatusCode::CONFLICT, message).into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 async fn fetch_commit(State(state): State<SharedDs>, Path(recipient): Path<String>) -> Response {
-    match state.fetch_commit(&recipient) {
+    let metrics = state.metrics().start("fetch_commit");
+    let response = match state.fetch_commit(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
+    };
+    metrics.finish(response.status().is_server_error());
+    response
+}
+
+async fn fetch_pending_commits(State(state): State<SharedDs>, uri: Uri) -> Response {
+    let metrics = state.metrics().start("fetch_pending_commits");
+    let response = match parse_pending_commits_query(uri.query().unwrap_or_default()) {
+        Ok((client, after_epoch)) => {
+            let commits = state.fetch_pending_commits(&client, after_epoch);
+            Json(commits).into_response()
+        }
+        Err(message) => (StatusCode::BAD_REQUEST, message).into_response(),
+    };
+    metrics.finish(response.status().is_server_error());
+    response
+}
+
+fn parse_pending_commits_query(raw: &str) -> Result<(String, u64), String> {
+    let mut client = None;
+    let mut after_epoch = None;
+
+    for part in raw.split('&') {
+        let Some((key, value)) = part.split_once('=') else {
+            continue;
+        };
+
+        match key {
+            "client" => client = Some(value.to_string()),
+            "after_epoch" => {
+                after_epoch = Some(
+                    value
+                        .parse::<u64>()
+                        .map_err(|_| format!("Invalid after_epoch '{}'", value))?,
+                );
+            }
+            _ => {}
+        }
     }
+
+    let client = client.ok_or_else(|| "Missing required client query parameter".to_string())?;
+    Ok((client, after_epoch.unwrap_or(0)))
 }
 
 async fn publish_welcome(
@@ -173,18 +237,23 @@ async fn publish_welcome(
     Path(recipient): Path<String>,
     body: Bytes,
 ) -> StatusCode {
+    let metrics = state.metrics().start("publish_welcome");
     state.publish_welcome(&recipient, body.to_vec());
     if debug_logs_enabled() {
         println!("[DS] Stored Welcome for {}", recipient);
     }
+    metrics.finish(false);
     StatusCode::OK
 }
 
 async fn fetch_welcome(State(state): State<SharedDs>, Path(recipient): Path<String>) -> Response {
-    match state.fetch_welcome(&recipient) {
+    let metrics = state.metrics().start("fetch_welcome");
+    let response = match state.fetch_welcome(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 async fn publish_ratchet_tree(
@@ -192,10 +261,12 @@ async fn publish_ratchet_tree(
     Path(recipient): Path<String>,
     body: Bytes,
 ) -> StatusCode {
+    let metrics = state.metrics().start("publish_ratchet_tree");
     state.publish_ratchet_tree(&recipient, body.to_vec());
     if debug_logs_enabled() {
         println!("[DS] Stored ratchet tree for {}", recipient);
     }
+    metrics.finish(false);
     StatusCode::OK
 }
 
@@ -203,10 +274,13 @@ async fn fetch_ratchet_tree(
     State(state): State<SharedDs>,
     Path(recipient): Path<String>,
 ) -> Response {
-    match state.fetch_ratchet_tree(&recipient) {
+    let metrics = state.metrics().start("fetch_ratchet_tree");
+    let response = match state.fetch_ratchet_tree(&recipient) {
         Some(bytes) => bytes_response(bytes),
         None => StatusCode::NOT_FOUND.into_response(),
-    }
+    };
+    metrics.finish(response.status().is_server_error());
+    response
 }
 
 fn bytes_response(bytes: Vec<u8>) -> Response {

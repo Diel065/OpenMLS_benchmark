@@ -1,6 +1,7 @@
 use std::fs;
 
 use anyhow::{anyhow, Context, Result};
+use clap::ArgAction;
 
 use mls_playground::staircase_runner::{
     parse_worker_specs, run_staircase_benchmark, StaircaseConfig,
@@ -74,11 +75,26 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     max_fanout_parallelism: usize,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = 0)]
+    min_fanout_parallelism: usize,
+
+    #[arg(long, action = ArgAction::SetTrue)]
     fanout_adaptive: bool,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_fanout_adaptive: bool,
+
+    #[arg(long, default_value_t = 0.0)]
+    fanout_error_rate_threshold: f64,
+
+    #[arg(long, default_value_t = 0)]
+    fanout_p95_threshold_ms: u128,
+
+    #[arg(long, default_value_t = 0)]
     http_pool_max_idle_per_host: usize,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    process_pending_fanout: bool,
 }
 
 fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
@@ -121,6 +137,20 @@ fn load_worker_specs(args: &Args) -> Result<Vec<String>> {
 
 fn main() -> Result<()> {
     let args = <Args as clap::Parser>::parse();
+    if args.fanout_adaptive && args.no_fanout_adaptive {
+        return Err(anyhow!(
+            "--fanout-adaptive and --no-fanout-adaptive cannot both be set"
+        ));
+    }
+
+    let fanout_adaptive = if args.no_fanout_adaptive {
+        Some(false)
+    } else if args.fanout_adaptive {
+        Some(true)
+    } else {
+        None
+    };
+
     let worker_specs = load_worker_specs(&args)?;
     let workers = parse_worker_specs(&worker_specs)?;
 
@@ -143,7 +173,11 @@ fn main() -> Result<()> {
         worker_health_timeout_seconds: args.worker_health_timeout_seconds,
         worker_health_poll_ms: args.worker_health_poll_ms,
         max_fanout_parallelism: args.max_fanout_parallelism,
-        fanout_adaptive: args.fanout_adaptive,
+        min_fanout_parallelism: args.min_fanout_parallelism,
+        fanout_adaptive,
+        fanout_error_rate_threshold: args.fanout_error_rate_threshold,
+        fanout_p95_threshold_ms: args.fanout_p95_threshold_ms,
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
+        process_pending_fanout: args.process_pending_fanout,
     })
 }

@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgAction, Parser};
 
 use mls_playground::local_launcher::{launch_local_stack, LocalLaunchConfig};
 use mls_playground::staircase_runner::{run_staircase_benchmark, StaircaseConfig};
@@ -66,15 +66,41 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     max_fanout_parallelism: usize,
 
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = 0)]
+    min_fanout_parallelism: usize,
+
+    #[arg(long, action = ArgAction::SetTrue)]
     fanout_adaptive: bool,
 
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, action = ArgAction::SetTrue)]
+    no_fanout_adaptive: bool,
+
+    #[arg(long, default_value_t = 0.0)]
+    fanout_error_rate_threshold: f64,
+
+    #[arg(long, default_value_t = 0)]
+    fanout_p95_threshold_ms: u128,
+
+    #[arg(long, default_value_t = 0)]
     http_pool_max_idle_per_host: usize,
+
+    #[arg(long, action = ArgAction::SetTrue)]
+    process_pending_fanout: bool,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if args.fanout_adaptive && args.no_fanout_adaptive {
+        anyhow::bail!("--fanout-adaptive and --no-fanout-adaptive cannot both be set");
+    }
+
+    let fanout_adaptive = if args.no_fanout_adaptive {
+        Some(false)
+    } else if args.fanout_adaptive {
+        Some(true)
+    } else {
+        None
+    };
 
     let deployment = launch_local_stack(&LocalLaunchConfig {
         worker_count: args.spawn_local_workers,
@@ -102,8 +128,12 @@ fn main() -> Result<()> {
         worker_health_timeout_seconds: 300,
         worker_health_poll_ms: 250,
         max_fanout_parallelism: args.max_fanout_parallelism,
-        fanout_adaptive: args.fanout_adaptive,
+        min_fanout_parallelism: args.min_fanout_parallelism,
+        fanout_adaptive,
+        fanout_error_rate_threshold: args.fanout_error_rate_threshold,
+        fanout_p95_threshold_ms: args.fanout_p95_threshold_ms,
         http_pool_max_idle_per_host: args.http_pool_max_idle_per_host,
+        process_pending_fanout: args.process_pending_fanout,
         run_id: args.run_id,
         scenario: args.scenario,
         output_dir: args.output_dir,

@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
+    error::Error as StdError,
     time::{Duration, Instant},
 };
 
@@ -11,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::client::{Client, CommitReceiveOutcome, EpochChangeOutput};
 use crate::http_retry::{
-    is_transient_reqwest_error, is_transient_status, retry_transient_http_async, RetryDecision,
+    is_connect_stage_reqwest_error, is_transient_reqwest_error, is_transient_status,
+    retry_transient_http_async, RetryDecision,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,14 +21,35 @@ use crate::http_retry::{
 pub enum Command {
     CreateGroup,
     GenerateKeyPackage,
-    AddMembers { members: Vec<String> },
+    AddMembers {
+        members: Vec<String>,
+    },
     JoinFromWelcome,
-    SendApplicationMessage { message: String },
-    ReceiveApplicationMessage { profile: bool },
+    SendApplicationMessage {
+        message: String,
+    },
+    ReceiveApplicationMessage {
+        profile: bool,
+    },
     SelfUpdate,
-    RemoveMembers { members: Vec<String> },
+    RemoveMembers {
+        members: Vec<String>,
+    },
     ReceiveCommit,
+    ProcessPending {
+        kinds: Option<Vec<PendingKind>>,
+        max_messages: Option<usize>,
+        expected_epoch: Option<u64>,
+    },
     ShowGroupState,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum PendingKind {
+    Commits,
+    Welcomes,
+    ApplicationMessages,
 }
 
 impl Command {
@@ -41,6 +64,7 @@ impl Command {
             Command::SelfUpdate => "SelfUpdate",
             Command::RemoveMembers { .. } => "RemoveMembers",
             Command::ReceiveCommit => "ReceiveCommit",
+            Command::ProcessPending { .. } => "ProcessPending",
             Command::ShowGroupState => "ShowGroupState",
         }
     }
@@ -54,6 +78,7 @@ impl Command {
                 | Command::SelfUpdate
                 | Command::RemoveMembers { .. }
                 | Command::ReceiveCommit
+                | Command::ProcessPending { .. }
         )
     }
 }
@@ -253,32 +278,88 @@ pub enum DsPostResult {
 
 static CONTROL_HTTP_CLIENT: Lazy<reqwest::Client> = Lazy::new(|| {
     reqwest::Client::builder()
-        .connect_timeout(Duration::from_secs(5))
-        .timeout(Duration::from_secs(60))
+        .connect_timeout(Duration::from_millis(worker_http_connect_timeout_ms()))
+        .timeout(Duration::from_millis(worker_http_request_timeout_ms()))
         .pool_max_idle_per_host(control_http_pool_max_idle_per_host())
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(30))
         .tcp_keepalive(Some(Duration::from_secs(60)))
         .build()
         .expect("failed to build shared worker control HTTP client")
 });
 
+static OUTBOUND_HTTP_SEMAPHORE: Lazy<tokio::sync::Semaphore> =
+    Lazy::new(|| tokio::sync::Semaphore::new(worker_outbound_http_permits()));
+
 fn control_http_pool_max_idle_per_host() -> usize {
-    std::env::var("OPENMLS_BENCH_HTTP_POOL_MAX_IDLE_PER_HOST")
+    std::env::var("OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST")
+        .or_else(|_| std::env::var("OPENMLS_BENCH_HTTP_POOL_MAX_IDLE_PER_HOST"))
         .ok()
         .and_then(|value| value.parse().ok())
-        .unwrap_or(32)
+        .unwrap_or(4)
+}
+
+fn worker_http_connect_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(2_000)
+}
+
+fn worker_http_request_timeout_ms() -> u64 {
+    std::env::var("OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(15_000)
+}
+
+fn worker_outbound_http_permits() -> usize {
+    std::env::var("OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|permits| *permits > 0)
+        .unwrap_or(2)
 }
 
 fn control_http_client() -> &'static reqwest::Client {
     &CONTROL_HTTP_CLIENT
 }
 
+async fn acquire_outbound_http_permit() -> tokio::sync::SemaphorePermit<'static> {
+    OUTBOUND_HTTP_SEMAPHORE
+        .acquire()
+        .await
+        .expect("worker outbound HTTP semaphore was closed")
+}
+
 fn transient_or_fatal<T>(err: reqwest::Error) -> RetryDecision<T> {
     if is_transient_reqwest_error(&err) {
-        RetryDecision::Transient(err.to_string())
+        RetryDecision::Transient(reqwest_error_diagnostic(&err))
     } else {
         RetryDecision::Fatal(anyhow!(err))
     }
+}
+
+fn reqwest_error_diagnostic(err: &reqwest::Error) -> String {
+    let mut parts = Vec::new();
+    parts.push(format!("top_level={}", err));
+    parts.push(format!("is_connect={}", err.is_connect()));
+    parts.push(format!("is_timeout={}", err.is_timeout()));
+    parts.push(format!("is_request={}", err.is_request()));
+    parts.push(format!("is_body={}", err.is_body()));
+    parts.push(format!(
+        "connect_stage={}",
+        is_connect_stage_reqwest_error(err)
+    ));
+
+    let mut source = err.source();
+    let mut idx = 0usize;
+    while let Some(err) = source {
+        parts.push(format!("source[{}]={}", idx, err));
+        source = err.source();
+        idx += 1;
+    }
+
+    parts.join("; ")
 }
 
 async fn read_response_text(response: reqwest::Response) -> String {
@@ -298,6 +379,7 @@ pub async fn ds_post_bytes_allow_conflict(
     retry_transient_http_async(op, Some(client_id), &url, || {
         let request_bytes = bytes.clone();
         async {
+            let _permit = acquire_outbound_http_permit().await;
             let response = match http.post(&url).body(request_bytes).send().await {
                 Ok(response) => response,
                 Err(err) => return transient_or_fatal(err),
@@ -349,6 +431,7 @@ pub async fn ds_put_json<T: Serialize>(
     let http = control_http_client();
 
     retry_transient_http_async(op, Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
         let response = match http.put(&url).json(body).send().await {
             Ok(response) => response,
             Err(err) => return transient_or_fatal(err),
@@ -380,6 +463,7 @@ pub async fn ds_get_bytes(ds_url: &str, path: &str, op: &str, client_id: &str) -
     let http = control_http_client();
 
     retry_transient_http_async(op, Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
         let response = match http.get(&url).send().await {
             Ok(response) => response,
             Err(err) => return transient_or_fatal(err),
@@ -399,6 +483,53 @@ pub async fn ds_get_bytes(ds_url: &str, path: &str, op: &str, client_id: &str) -
 
         match response.bytes().await {
             Ok(bytes) => RetryDecision::Success(bytes.to_vec()),
+            Err(err) => transient_or_fatal(err),
+        }
+    })
+    .await
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PendingCommitResponse {
+    group_id: String,
+    epoch: u64,
+    sender: String,
+    commit_hex: String,
+}
+
+async fn ds_get_pending_commits(
+    ds_url: &str,
+    client_id: &str,
+    after_epoch: u64,
+) -> Result<Vec<PendingCommitResponse>> {
+    let url = format!("{ds_url}/commits/pending?client={client_id}&after_epoch={after_epoch}");
+    let http = control_http_client();
+
+    retry_transient_http_async("fetch_pending_commits", Some(client_id), &url, || async {
+        let _permit = acquire_outbound_http_permit().await;
+        let response = match http.get(&url).send().await {
+            Ok(response) => response,
+            Err(err) => return transient_or_fatal(err),
+        };
+
+        let status = response.status();
+
+        if !status.is_success() {
+            let body = read_response_text(response).await;
+
+            if is_transient_status(status) {
+                return RetryDecision::Transient(format!("HTTP {}: {}", status, body));
+            }
+
+            return RetryDecision::Fatal(anyhow!(
+                "DS pending commits GET failed with status {}: {}",
+                status,
+                body
+            ));
+        }
+
+        match response.json::<Vec<PendingCommitResponse>>().await {
+            Ok(commits) => RetryDecision::Success(commits),
             Err(err) => transient_or_fatal(err),
         }
     })
@@ -430,6 +561,7 @@ pub async fn relay_post_application_message(
             let recipients_header = recipients_header.clone();
             let request_bytes = bytes.clone();
             async {
+                let _permit = acquire_outbound_http_permit().await;
                 let response = match http
                     .post(&url)
                     .header("x-recipients", recipients_header)
@@ -477,6 +609,7 @@ pub async fn relay_get_application_message(relay_url: &str, recipient: &str) -> 
         Some(recipient),
         &url,
         || async {
+            let _permit = acquire_outbound_http_permit().await;
             let response = match http.get(&url).send().await {
                 Ok(response) => response,
                 Err(err) => return transient_or_fatal(err),
@@ -600,6 +733,209 @@ pub async fn maybe_retry_pending_intent(
                 message
             )))
         }
+    }
+}
+
+async fn apply_commit_bytes(
+    client: &mut Client,
+    ds_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+    commit_bytes: &[u8],
+) -> Result<String> {
+    match client.receive_commit(commit_bytes)? {
+        CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
+            if self_removed {
+                *queued_intent = None;
+                Ok("external commit received and processed; this client was removed and local group state was cleared".to_string())
+            } else {
+                update_ds_group_state(client, ds_url).await?;
+
+                let retry_message =
+                    maybe_retry_pending_intent(client, ds_url, queued_intent).await?;
+
+                match retry_message {
+                    Some(text) => Ok(format!(
+                        "external commit received and processed; DS group state updated; {}",
+                        text
+                    )),
+                    None => Ok(
+                        "external commit received and processed; DS group state updated"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
+
+        CommitReceiveOutcome::OwnCommitAccepted {
+            self_removed,
+            welcome_recipients,
+            welcome_bytes,
+            ratchet_tree_bytes,
+        } => {
+            if self_removed {
+                *queued_intent = None;
+                Ok("own commit accepted from DS; this client was removed and local group state was cleared".to_string())
+            } else {
+                if let (Some(welcome), Some(tree)) = (welcome_bytes, ratchet_tree_bytes) {
+                    let client_id = client.name.clone();
+                    let publish_tasks = welcome_recipients.iter().map(|recipient| {
+                        let recipient = recipient.clone();
+                        let welcome = welcome.clone();
+                        let tree = tree.clone();
+                        let client_id = client_id.clone();
+                        async move {
+                            let welcome_path = format!("/welcome/{recipient}");
+                            ds_post_bytes(
+                                ds_url,
+                                &welcome_path,
+                                welcome.clone(),
+                                "store_welcome",
+                                &client_id,
+                            )
+                            .await?;
+
+                            let tree_path = format!("/ratchet-tree/{recipient}");
+                            ds_post_bytes(
+                                ds_url,
+                                &tree_path,
+                                tree.clone(),
+                                "store_ratchet_tree",
+                                &client_id,
+                            )
+                            .await
+                        }
+                    });
+                    try_join_all(publish_tasks).await?;
+                }
+
+                update_ds_group_state(client, ds_url).await?;
+                Ok(
+                    "own commit accepted from DS; local state updated and welcome/tree published"
+                        .to_string(),
+                )
+            }
+        }
+    }
+}
+
+async fn process_pending(
+    client: &mut Client,
+    ds_url: &str,
+    relay_url: &str,
+    queued_intent: &mut Option<PendingIntent>,
+    kinds: Option<Vec<PendingKind>>,
+    max_messages: Option<usize>,
+    expected_epoch: Option<u64>,
+) -> Result<String> {
+    let kinds = kinds.unwrap_or_else(|| {
+        vec![
+            PendingKind::Commits,
+            PendingKind::Welcomes,
+            PendingKind::ApplicationMessages,
+        ]
+    });
+    let max_messages = max_messages.unwrap_or(usize::MAX);
+    let mut remaining = max_messages;
+    let mut commits_processed = 0usize;
+    let mut welcomes_processed = 0usize;
+    let mut application_messages_processed = 0usize;
+    let mut errors = Vec::new();
+
+    if remaining > 0 && kinds.contains(&PendingKind::Commits) {
+        let after_epoch = client.current_epoch_u64().unwrap_or(0);
+        let pending_commits = ds_get_pending_commits(ds_url, &client.name, after_epoch).await?;
+
+        for pending in pending_commits.into_iter().take(remaining) {
+            let commit_bytes = hex::decode(&pending.commit_hex).with_context(|| {
+                format!(
+                    "decode pending commit group={} epoch={} sender={}",
+                    pending.group_id, pending.epoch, pending.sender
+                )
+            })?;
+
+            match apply_commit_bytes(client, ds_url, queued_intent, &commit_bytes).await {
+                Ok(_) => {
+                    commits_processed += 1;
+                    remaining = remaining.saturating_sub(1);
+                }
+                Err(err) => {
+                    errors.push(format!(
+                        "commit group={} epoch={} sender={} error={:#}",
+                        pending.group_id, pending.epoch, pending.sender, err
+                    ));
+                    break;
+                }
+            }
+        }
+    }
+
+    if remaining > 0 && kinds.contains(&PendingKind::Welcomes) {
+        let welcome_path = format!("/welcome/{}", client.name);
+        let tree_path = format!("/ratchet-tree/{}", client.name);
+
+        match ds_get_bytes(ds_url, &welcome_path, "fetch_welcome", &client.name).await {
+            Ok(welcome_bytes) => {
+                let ratchet_tree_bytes =
+                    ds_get_bytes(ds_url, &tree_path, "fetch_ratchet_tree", &client.name).await?;
+                client.join_from_welcome(&welcome_bytes, &ratchet_tree_bytes)?;
+                welcomes_processed += 1;
+                remaining = remaining.saturating_sub(1);
+            }
+            Err(err) => {
+                let text = format!("{:#}", err);
+                if !text.contains("404 Not Found") {
+                    errors.push(format!("welcome error={}", text));
+                }
+            }
+        }
+    }
+
+    if remaining > 0 && kinds.contains(&PendingKind::ApplicationMessages) {
+        match relay_get_application_message(relay_url, &client.name).await {
+            Ok(message_bytes) => {
+                let _ = client.receive_application_message(&message_bytes, false)?;
+                application_messages_processed += 1;
+            }
+            Err(err) => {
+                let text = format!("{:#}", err);
+                if !text.contains("404 Not Found") {
+                    errors.push(format!("application_message error={}", text));
+                }
+            }
+        }
+    }
+
+    let final_epoch = client.current_epoch_u64().ok();
+    let current_member_count = client.member_names().ok().map(|members| members.len());
+
+    if let (Some(expected), Some(actual)) = (expected_epoch, final_epoch) {
+        if actual < expected {
+            errors.push(format!(
+                "expected_epoch_not_reached expected={} actual={}",
+                expected, actual
+            ));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(format!(
+            "process_pending processed; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} errors=[]",
+            commits_processed,
+            welcomes_processed,
+            application_messages_processed,
+            final_epoch,
+            current_member_count
+        ))
+    } else {
+        Err(anyhow!(
+            "process_pending errors; commits_processed={} welcomes_processed={} application_messages_processed={} final_epoch={:?} current_member_count={:?} errors={:?}",
+            commits_processed,
+            welcomes_processed,
+            application_messages_processed,
+            final_epoch,
+            current_member_count,
+            errors
+        ))
     }
 }
 
@@ -744,78 +1080,24 @@ pub async fn handle_command(
             let path = format!("/commit/{}", client.name);
             let commit_bytes = ds_get_bytes(ds_url, &path, "fetch_commit", &client.name).await?;
 
-            match client.receive_commit(&commit_bytes)? {
-                CommitReceiveOutcome::ExternalCommitApplied { self_removed } => {
-                    if self_removed {
-                        *queued_intent = None;
-                        Ok("external commit received and processed; this client was removed and local group state was cleared".to_string())
-                    } else {
-                        update_ds_group_state(client, ds_url).await?;
+            apply_commit_bytes(client, ds_url, queued_intent, &commit_bytes).await
+        }
 
-                        let retry_message =
-                            maybe_retry_pending_intent(client, ds_url, queued_intent).await?;
-
-                        match retry_message {
-                            Some(text) => Ok(format!(
-                                "external commit received and processed; DS group state updated; {}",
-                                text
-                            )),
-                            None => Ok(
-                                "external commit received and processed; DS group state updated"
-                                    .to_string(),
-                            ),
-                        }
-                    }
-                }
-
-                CommitReceiveOutcome::OwnCommitAccepted {
-                    self_removed,
-                    welcome_recipients,
-                    welcome_bytes,
-                    ratchet_tree_bytes,
-                } => {
-                    if self_removed {
-                        *queued_intent = None;
-                        Ok("own commit accepted from DS; this client was removed and local group state was cleared".to_string())
-                    } else {
-                        if let (Some(welcome), Some(tree)) = (welcome_bytes, ratchet_tree_bytes) {
-                            let client_id = client.name.clone();
-                            let publish_tasks = welcome_recipients.iter().map(|recipient| {
-                                let recipient = recipient.clone();
-                                let welcome = welcome.clone();
-                                let tree = tree.clone();
-                                let client_id = client_id.clone();
-                                async move {
-                                    let welcome_path = format!("/welcome/{recipient}");
-                                    ds_post_bytes(
-                                        ds_url,
-                                        &welcome_path,
-                                        welcome.clone(),
-                                        "store_welcome",
-                                        &client_id,
-                                    )
-                                    .await?;
-
-                                    let tree_path = format!("/ratchet-tree/{recipient}");
-                                    ds_post_bytes(
-                                        ds_url,
-                                        &tree_path,
-                                        tree.clone(),
-                                        "store_ratchet_tree",
-                                        &client_id,
-                                    )
-                                    .await
-                                }
-                            });
-                            try_join_all(publish_tasks).await?;
-                        }
-
-                        update_ds_group_state(client, ds_url).await?;
-                        Ok("own commit accepted from DS; local state updated and welcome/tree published"
-                            .to_string())
-                    }
-                }
-            }
+        Command::ProcessPending {
+            kinds,
+            max_messages,
+            expected_epoch,
+        } => {
+            process_pending(
+                client,
+                ds_url,
+                relay_url,
+                queued_intent,
+                kinds,
+                max_messages,
+                expected_epoch,
+            )
+            .await
         }
 
         Command::ShowGroupState => {

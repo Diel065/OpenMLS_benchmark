@@ -290,14 +290,18 @@ async fn main() -> Result<()> {
 
     if debug_enabled || debug_logs_enabled() {
         eprintln!(
-            "[WORKER {}] starting on http://{} with DS={} RELAY={} queue_capacity={} idempotency_cache_size={} idempotency_cache_ttl_seconds={}",
+            "[WORKER {}] starting on http://{} with DS={} RELAY={} queue_capacity={} idempotency_cache_size={} idempotency_cache_ttl_seconds={} outbound_http_permits={} http_pool_max_idle_per_host={} http_connect_timeout_ms={} http_request_timeout_ms={}",
             name,
             listen_addr,
             ds_url,
             relay_url,
             queue_capacity,
             cache_size,
-            cache_ttl.as_secs()
+            cache_ttl.as_secs(),
+            std::env::var("OPENMLS_WORKER_OUTBOUND_HTTP_PERMITS").unwrap_or_else(|_| "2".to_string()),
+            std::env::var("OPENMLS_WORKER_HTTP_POOL_MAX_IDLE_PER_HOST").unwrap_or_else(|_| "4".to_string()),
+            std::env::var("OPENMLS_WORKER_HTTP_CONNECT_TIMEOUT_MS").unwrap_or_else(|_| "2000".to_string()),
+            std::env::var("OPENMLS_WORKER_HTTP_REQUEST_TIMEOUT_MS").unwrap_or_else(|_| "15000".to_string())
         );
     }
 
