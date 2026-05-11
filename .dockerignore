@@ -1,0 +1,7 @@
+target
+benchmark_output
+.git
+.gitignore
+Dockerfile*
+docker-compose.yml
+*.log

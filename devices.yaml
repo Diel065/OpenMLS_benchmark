@@ -1,0 +1,67 @@
+devices:
+  - id: luckfox-pico-plus-01
+    enabled: true
+    kind: luckfox_pico_plus
+
+    connection:
+      type: adb
+      serial: "242d5fe430c7c951"
+
+    transport:
+      type: usb_rndis
+      device_ip: "172.32.0.93"
+      host_ip: "172.32.0.98"
+      worker_port: 8080
+
+    target:
+      arch: "armv7l"
+      rust_target: "armv7-unknown-linux-musleabihf"
+      binary: "target/armv7-unknown-linux-musleabihf/minsize/worker"
+
+    worker:
+      id: "pico-plus-00001"
+      mode: "singleton"
+      remote_binary: "/worker"
+      remote_root: "/opt/signal-benchmark"
+      remote_results_root: "/results/signal"
+      remote_tmp: "/tmp/signal-benchmark"
+
+    metadata:
+      execution_backend: "real_device"
+      device_kind: "luckfox_pico_plus"
+      transport: "usb_rndis"
+      access_backend: "adb"
+
+  - id: raspberry-pi-01
+    enabled: false
+    kind: raspberry_pi
+
+    connection:
+      type: ssh
+      host: "192.168.50.20"
+      user: "pi"
+      identity_file: "~/.ssh/raspi_benchmark"
+
+    transport:
+      type: ethernet
+      device_ip: "192.168.50.20"
+      host_ip: "192.168.50.1"
+      worker_port: 8080
+
+    target:
+      arch: "aarch64"
+      rust_target: "aarch64-unknown-linux-gnu"
+      binary: "target/aarch64-unknown-linux-gnu/release/worker"
+
+    worker:
+      id: "raspi-00001"
+      mode: "singleton"
+      remote_binary: "/opt/signal-benchmark/bin/worker"
+      remote_results_root: "/results/signal"
+      remote_tmp: "/tmp/signal-benchmark"
+
+    metadata:
+      execution_backend: "real_device"
+      device_kind: "raspberry_pi"
+      transport: "ethernet"
+      access_backend: "ssh"
